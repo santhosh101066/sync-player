@@ -5,6 +5,7 @@ import { IncomingMessage } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import fs from "fs";
 import path from "path";
+import internal from "stream";
 
 
 // ==== 1. Proxy Helper Functions ====
@@ -13,10 +14,10 @@ import path from "path";
 let areUserControlsAllowed = false;
 
 let currentVideoState = {
-    url: "",
-    time: 0,
-    paused: true,
-    timestamp: Date.now() // When this state was recorded
+  url: "",
+  time: 0,
+  paused: true,
+  timestamp: Date.now() // When this state was recorded
 };
 
 function assertHttpUrl(raw: string) {
@@ -116,6 +117,7 @@ const init = async () => {
             responseType: 'stream',
             headers: requestHeaders,
             validateStatus: () => true,
+            decompress: false, // Disable auto-decompression to forward raw stream and headers (Content-Length)
           });
 
           const stream = response.data as IncomingMessage;
@@ -150,13 +152,16 @@ const init = async () => {
 
           const decodedUrl = Buffer.from(url, "base64").toString("utf-8");
           const referer = ref ? Buffer.from(ref, "base64").toString("utf-8") : undefined;
-          
+
           // 1. SAFETY CHECK: If the requested URL is actually a .ts segment, 
           // redirect to the stream proxy immediately.
           // This prevents trying to parse binary video data as a text playlist.
-          if (decodedUrl.match(/\.ts($|\?)/i)) {
-             const streamUrl = `/api/proxy/stream?url=${url}` + (ref ? `&ref=${ref}` : "");
-             return h.redirect(streamUrl);
+          // 1. SAFETY CHECK: If the requested URL is actually a video file, 
+          // redirect to the stream proxy immediately.
+          // This prevents trying to parse binary video data as a text playlist.
+          if (decodedUrl.match(/\.(ts|mp4|mkv|webm)($|\?)/i)) {
+            const streamUrl = `/api/proxy/stream?url=${url}` + (ref ? `&ref=${ref}` : "");
+            return h.redirect(streamUrl);
           }
 
           const playlistUrl = assertHttpUrl(decodedUrl).href;
@@ -174,12 +179,12 @@ const init = async () => {
           if (resp.status < 200 || resp.status >= 300) return h.response({ error: "Fetch failed" }).code(resp.status);
 
           const body = resp.data || "";
-          
+
           // Check if it's actually a playlist
           if (!body.startsWith("#EXTM3U")) {
-             // If it's not a playlist, just pass it through as a stream
-             const streamUrl = `/api/proxy/stream?url=${url}` + (ref ? `&ref=${ref}` : "");
-             return h.redirect(streamUrl);
+            // If it's not a playlist, just pass it through as a stream
+            const streamUrl = `/api/proxy/stream?url=${url}` + (ref ? `&ref=${ref}` : "");
+            return h.redirect(streamUrl);
           }
 
           // Regex to find URI attributes or lines that look like URLs
@@ -193,7 +198,7 @@ const init = async () => {
 
               // Resolve relative URLs to absolute
               const absolute = new URL(urlToRewrite, playlistUrl).href;
-              
+
               const b64url = Buffer.from(absolute).toString("base64");
               const b64ref = referer ? Buffer.from(referer).toString("base64") : undefined;
 
@@ -242,22 +247,60 @@ const init = async () => {
 
   // ==== 4. WebSocket Server (Multi-User Audio & Sync) ====
 
-  const wss = new WebSocketServer({ server: server.listener, path: "/sync" });
+  const wssSignaling = new WebSocketServer({ noServer: true });
+  // 2. Voice Server (Audio Data) - Binary Only
+  const wssVoice = new WebSocketServer({ noServer: true });
 
   // Store connected users: userId -> { ws, nick, isAdmin }
-  const clients = new Map<number, { ws: WebSocket; nick: string; isAdmin: boolean ,isMuted: boolean}>();
+  const clients = new Map<number, { ws: WebSocket; nick: string; isAdmin: boolean; isMuted: boolean }>();
 
-  wss.on("connection", (ws: WebSocket) => {
+  server.listener.on('upgrade', (request: IncomingMessage, socket: internal.Duplex, head: Buffer) => {
+    const { url } = request;
+
+    if (url === '/sync') {
+      wssSignaling.handleUpgrade(request, socket, head, (ws) => {
+        wssSignaling.emit('connection', ws, request);
+      });
+    } else if (url === '/voice') {
+      wssVoice.handleUpgrade(request, socket, head, (ws) => {
+        wssVoice.emit('connection', ws, request);
+      });
+    } else {
+      socket.destroy();
+    }
+  });
+
+  wssVoice.on("connection", (ws: WebSocket) => {
+    // We expect the FIRST message to be the UserID (4 bytes) to identify who this stream belongs to
+    // or we can rely on the client sending ID in every packet (current implementation does this).
+
+    ws.on("message", (data: any, isBinary: boolean) => {
+      if (!isBinary) return; // Ignore non-binary on voice channel
+
+      // Broadcast audio to all other voice clients immediately
+      wssVoice.clients.forEach((client) => {
+        if (client !== ws && client.readyState === WebSocket.OPEN) {
+          // In your current implementation, the client sends [UserID + PCM].
+          // We just forward it raw. fast.
+          client.send(data, { binary: true });
+        }
+      });
+    });
+  });
+
+  wssSignaling.on("connection", (ws: WebSocket) => {
     // Assign a random 32-bit integer as User ID for this session
     const userId = Math.floor(Math.random() * 0xFFFFFFFF);
-    clients.set(userId, { ws, nick: `User ${userId}`, isAdmin: false ,isMuted: false});
+    clients.set(userId, { ws, nick: `User ${userId}`, isAdmin: false, isMuted: false });
+
+    ws.send(JSON.stringify({ type: 'welcome', userId: userId }));
 
     const broadcastSystemState = () => {
       const stateMsg = JSON.stringify({
         type: 'system-state',
         userControlsAllowed: areUserControlsAllowed
       });
-      wss.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(stateMsg));
+      wssSignaling.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(stateMsg));
     };
     // Helper to broadcast user list to admins
     const broadcastUserList = () => {
@@ -269,7 +312,7 @@ const init = async () => {
       }));
 
       // CHANGE: Send to ALL connected clients, not just admins
-      wss.clients.forEach((client) => {
+      wssSignaling.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({ type: 'user-list', users: userList }));
         }
@@ -280,140 +323,130 @@ const init = async () => {
       const sender = clients.get(userId);
       if (!sender) return;
 
-      if (isBinary) {
-        if (sender.isMuted) return;
-        // --- AUDIO PACKET HANDLING ---
-        wss.clients.forEach((client) => {
-          if (client !== ws && client.readyState === WebSocket.OPEN) {
-            const userIdBuf = Buffer.alloc(4);
-            userIdBuf.writeUInt32BE(userId, 0); // Big Endian
-            const payload = Buffer.concat([userIdBuf, data]);
-            client.send(payload, { binary: true });
-          }
-        });
-      } else {
-        // --- TEXT PACKET HANDLING ---
-        try {
-          const msg = JSON.parse(data.toString());
+      if (isBinary) return;
 
-          if (msg.type === 'toggle-user-controls') {
-            if (sender.isAdmin) {
-              areUserControlsAllowed = !!msg.value;
-              broadcastSystemState();
+      // --- TEXT PACKET HANDLING ---
+      try {
+        const msg = JSON.parse(data.toString());
 
-              // Notify via chat
-              const chatMsg = JSON.stringify({
-                type: 'chat', nick: 'System', isSystem: true,
-                text: areUserControlsAllowed ? '🔓 User controls enabled' : '🔒 User controls disabled'
-              });
-              wss.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(chatMsg));
-            }
-            return;
-          }
-          if (msg.type === 'sync' || msg.type === 'forceSync') {
-            if (sender.isAdmin || areUserControlsAllowed) {
-                  currentVideoState = {
-                      url: msg.url || currentVideoState.url,
-                      time: msg.time,
-                      paused: msg.paused,
-                      timestamp: Date.now()
-                  };
-                  // Broadcast to everyone
-                  wss.clients.forEach((client) => {
-                    if (client !== ws && client.readyState === WebSocket.OPEN) {
-                      client.send(data, { binary: false });
-                    }
-                  });
-            }
-          }
-          if (msg.type === 'timeUpdate') {
-             if (sender.isAdmin || areUserControlsAllowed) {
-                currentVideoState.time = msg.time;
-                currentVideoState.timestamp = Date.now();
-                currentVideoState.paused = msg.paused;
-                // We do NOT broadcast this to avoid network spam. 
-                // Clients sync via the initial join or manual events.
-             }
-          }
+        if (msg.type === 'toggle-user-controls') {
+          if (sender.isAdmin) {
+            areUserControlsAllowed = !!msg.value;
+            broadcastSystemState();
 
-          // 3. Playback Sync (Admin OR Allowed Users)
-          if (msg.type === 'load' && sender.isAdmin) {
-              currentVideoState.url = msg.url;
-              currentVideoState.time = 0;
-              currentVideoState.paused = false; // Auto-play on load
-              currentVideoState.timestamp = Date.now();
-          }
-          if (msg.type === 'mute-user' && sender.isAdmin) {
-              const target = clients.get(msg.targetId);
-              if (target) {
-                  target.isMuted = !target.isMuted; // Toggle
-                  broadcastUserList(); // Update UI
-              }
-          }
-
-          if (msg.type === 'identify') {
-            sender.nick = msg.nick || `User ${userId}`;
-            broadcastUserList();
-            ws.send(JSON.stringify({ type: 'system-state', userControlsAllowed: areUserControlsAllowed }));
-            const joinMsg = JSON.stringify({
-              type: 'chat',
-              nick: 'System',
-              text: `${sender.nick} joined the session`,
-              isSystem: true
+            // Notify via chat
+            const chatMsg = JSON.stringify({
+              type: 'chat', nick: 'System', isSystem: true,
+              text: areUserControlsAllowed ? '🔓 User controls enabled' : '🔒 User controls disabled'
             });
-
-            wss.clients.forEach((client) => {
-              if (client.readyState === WebSocket.OPEN) {
-                client.send(joinMsg);
-              }
-            });
-            if (currentVideoState.url) {
-                // Calculate estimated current time
-                let estimatedTime = currentVideoState.time;
-                if (!currentVideoState.paused) {
-                    const elapsed = (Date.now() - currentVideoState.timestamp) / 1000;
-                    estimatedTime += elapsed;
-                }
-                
-                ws.send(JSON.stringify({
-                    type: 'forceSync', // Force them to jump
-                    url: currentVideoState.url,
-                    time: estimatedTime,
-                    paused: currentVideoState.paused
-                }));
-            }
-          } else if (msg.type === 'admin-login') {
-            if (msg.password === 'admin123') { // Replace with real auth check
-              sender.isAdmin = true;
-              ws.send(JSON.stringify({ type: 'admin-success' }));
-              broadcastUserList();
-              ws.send(JSON.stringify({ type: 'system-state', userControlsAllowed: areUserControlsAllowed }));
-
-            } else {
-              ws.send(JSON.stringify({ type: 'admin-fail' }));
-            }
-          } else if (msg.type === 'kick-user') {
-            if (sender.isAdmin) {
-              const targetId = msg.targetId;
-              const target = clients.get(targetId);
-              if (target && target.ws.readyState === WebSocket.OPEN) {
-                target.ws.close();
-                clients.delete(targetId);
-                broadcastUserList();
-              }
-            }
-          } else {
-            // Broadcast other messages (chat, sync, etc.)
-            wss.clients.forEach((client) => {
+            wssSignaling.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(chatMsg));
+          }
+          return;
+        }
+        if (msg.type === 'sync' || msg.type === 'forceSync') {
+          if (sender.isAdmin || areUserControlsAllowed) {
+            currentVideoState = {
+              url: msg.url || currentVideoState.url,
+              time: msg.time,
+              paused: msg.paused,
+              timestamp: Date.now()
+            };
+            // Broadcast to everyone
+            wssSignaling.clients.forEach((client) => {
               if (client !== ws && client.readyState === WebSocket.OPEN) {
                 client.send(data, { binary: false });
               }
             });
           }
-        } catch (e) {
-          console.error("WS Message Error", e);
         }
+        if (msg.type === 'timeUpdate') {
+          if (sender.isAdmin || areUserControlsAllowed) {
+            currentVideoState.time = msg.time;
+            currentVideoState.timestamp = Date.now();
+            currentVideoState.paused = msg.paused;
+            // We do NOT broadcast this to avoid network spam. 
+            // Clients sync via the initial join or manual events.
+          }
+        }
+
+        // 3. Playback Sync (Admin OR Allowed Users)
+        if (msg.type === 'load' && sender.isAdmin) {
+          currentVideoState.url = msg.url;
+          currentVideoState.time = 0;
+          currentVideoState.paused = false; // Auto-play on load
+          currentVideoState.timestamp = Date.now();
+        }
+        if (msg.type === 'mute-user' && sender.isAdmin) {
+          const target = clients.get(msg.targetId);
+          if (target) {
+            target.isMuted = !target.isMuted; // Toggle
+            broadcastUserList(); // Update UI
+          }
+        }
+
+        if (msg.type === 'identify') {
+          sender.nick = msg.nick || `User ${userId}`;
+          broadcastUserList();
+          ws.send(JSON.stringify({ type: 'system-state', userControlsAllowed: areUserControlsAllowed }));
+          const joinMsg = JSON.stringify({
+            type: 'chat',
+            nick: 'System',
+            text: `${sender.nick} joined the session`,
+            isSystem: true
+          });
+
+          wssSignaling.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(joinMsg);
+            }
+          });
+          if (currentVideoState.url) {
+            // Calculate estimated current time
+            let estimatedTime = currentVideoState.time;
+            if (!currentVideoState.paused) {
+              const elapsed = (Date.now() - currentVideoState.timestamp) / 1000;
+              estimatedTime += elapsed;
+            }
+
+            ws.send(JSON.stringify({
+              type: 'forceSync', // Force them to jump
+              url: currentVideoState.url,
+              time: estimatedTime,
+              paused: currentVideoState.paused
+            }));
+          }
+        } else if (msg.type === 'admin-login') {
+          if (msg.password === 'admin123') { // Replace with real auth check
+            sender.isAdmin = true;
+            ws.send(JSON.stringify({ type: 'admin-success' }));
+            broadcastUserList();
+            ws.send(JSON.stringify({ type: 'system-state', userControlsAllowed: areUserControlsAllowed }));
+
+          } else {
+            ws.send(JSON.stringify({ type: 'admin-fail' }));
+          }
+        } else if (msg.type === 'kick-user') {
+          if (sender.isAdmin) {
+            const targetId = msg.targetId;
+            const target = clients.get(targetId);
+            if (target && target.ws.readyState === WebSocket.OPEN) {
+              target.ws.close();
+              clients.delete(targetId);
+              broadcastUserList();
+            }
+          }
+        } else {
+          // Broadcast other messages (chat, sync, etc.)
+          wssSignaling.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              client.send(data, { binary: false });
+            }
+          });
+        }
+      } catch (e) {
+        console.error("WS Message Error", e);
       }
+
     });
 
     ws.on("close", () => {
@@ -427,7 +460,7 @@ const init = async () => {
           text: `${nick} left`,
           isSystem: true
         });
-        wss.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(leaveMsg));
+        wssSignaling.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(leaveMsg));
       }
     });
   });
