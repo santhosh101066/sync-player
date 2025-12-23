@@ -12,6 +12,7 @@ import internal from "stream";
 // These functions help rewrite M3U8 playlists so they point back to our proxy
 // ensuring CORS issues are bypassed for external HLS streams.
 let areUserControlsAllowed = false;
+let isProxyEnabled = true; // Default to TRUE (existing behavior)
 
 let currentVideoState = {
   url: "",
@@ -298,7 +299,8 @@ const init = async () => {
     const broadcastSystemState = () => {
       const stateMsg = JSON.stringify({
         type: 'system-state',
-        userControlsAllowed: areUserControlsAllowed
+        userControlsAllowed: areUserControlsAllowed,
+        proxyEnabled: isProxyEnabled
       });
       wssSignaling.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(stateMsg));
     };
@@ -338,6 +340,21 @@ const init = async () => {
             const chatMsg = JSON.stringify({
               type: 'chat', nick: 'System', isSystem: true,
               text: areUserControlsAllowed ? '🔓 User controls enabled' : '🔒 User controls disabled'
+            });
+            wssSignaling.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(chatMsg));
+          }
+          return;
+        }
+
+        if (msg.type === 'toggle-proxy') {
+          if (sender.isAdmin) {
+            isProxyEnabled = !!msg.value;
+            broadcastSystemState();
+
+            // Notify via chat
+            const chatMsg = JSON.stringify({
+              type: 'chat', nick: 'System', isSystem: true,
+              text: isProxyEnabled ? '📡 Proxy Mode ENABLED' : '🔌 Proxy Mode DISABLED'
             });
             wssSignaling.clients.forEach(c => c.readyState === WebSocket.OPEN && c.send(chatMsg));
           }
@@ -387,7 +404,12 @@ const init = async () => {
         if (msg.type === 'identify') {
           sender.nick = msg.nick || `User ${userId}`;
           broadcastUserList();
-          ws.send(JSON.stringify({ type: 'system-state', userControlsAllowed: areUserControlsAllowed }));
+          broadcastUserList();
+          ws.send(JSON.stringify({
+            type: 'system-state',
+            userControlsAllowed: areUserControlsAllowed,
+            proxyEnabled: isProxyEnabled
+          }));
           const joinMsg = JSON.stringify({
             type: 'chat',
             nick: 'System',
@@ -420,7 +442,12 @@ const init = async () => {
             sender.isAdmin = true;
             ws.send(JSON.stringify({ type: 'admin-success' }));
             broadcastUserList();
-            ws.send(JSON.stringify({ type: 'system-state', userControlsAllowed: areUserControlsAllowed }));
+            broadcastUserList();
+            ws.send(JSON.stringify({
+              type: 'system-state',
+              userControlsAllowed: areUserControlsAllowed,
+              proxyEnabled: isProxyEnabled
+            }));
 
           } else {
             ws.send(JSON.stringify({ type: 'admin-fail' }));
