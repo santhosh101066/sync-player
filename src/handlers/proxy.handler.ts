@@ -1,0 +1,114 @@
+import { Request, ResponseToolkit } from "@hapi/hapi";
+import axios from "axios";
+import { assertHttpUrl, getProxiedUrl } from "../utils/url.utils";
+import { IncomingMessage } from "http";
+
+export const proxyStreamHandler = async (request: Request, h: ResponseToolkit) => {
+    const { url, ref } = request.query;
+    if (!url) return h.response({ error: 'No URL' }).code(400);
+
+    try {
+        const decodedUrl = Buffer.from(url, 'base64').toString('utf-8');
+        const referer = ref ? Buffer.from(ref, 'base64').toString('utf-8') : undefined;
+
+        const requestHeaders: Record<string, string | undefined> = {
+            'Referer': referer,
+            'User-Agent': request.headers['user-agent'],
+            'Accept': request.headers['accept'],
+            'Accept-Encoding': request.headers['accept-encoding'],
+        };
+        if (request.headers.range) requestHeaders['Range'] = request.headers.range;
+
+        const response = await axios.get(decodedUrl, {
+            responseType: 'stream',
+            headers: requestHeaders,
+            validateStatus: () => true,
+            decompress: false,
+        });
+
+        const stream = response.data as IncomingMessage;
+        const hapiResponse = h.response(stream).code(response.status);
+
+        const headersToCopy = [
+            'content-type', 'content-length', 'accept-ranges',
+            'content-range', 'date', 'last-modified', 'etag',
+        ];
+
+        for (const [key, value] of Object.entries(response.headers)) {
+            if (value && headersToCopy.includes(key.toLowerCase())) {
+                hapiResponse.header(key, value.toString());
+            }
+        }
+        return hapiResponse;
+    } catch (error: any) {
+        console.error('[/proxy/stream] error:', error.message || error);
+        return h.response({ error: 'Upstream error' }).code(500);
+    }
+};
+
+export const proxyPlaylistHandler = async (request: Request, h: ResponseToolkit) => {
+    try {
+        const { url, ref } = request.query;
+        if (!url) return h.response({ error: "No URL" }).code(400);
+
+        const decodedUrl = Buffer.from(url, "base64").toString("utf-8");
+        const referer = ref ? Buffer.from(ref, "base64").toString("utf-8") : undefined;
+
+        if (decodedUrl.match(/\.(ts|mp4|mkv|webm)($|\?)/i)) {
+            const streamUrl = `/api/proxy/stream?url=${url}` + (ref ? `&ref=${ref}` : "");
+            return h.redirect(streamUrl);
+        }
+
+        const playlistUrl = assertHttpUrl(decodedUrl).href;
+        const headers: Record<string, string> = {};
+        if (referer) headers["Referer"] = referer;
+
+        const resp = await axios.get<string>(playlistUrl, {
+            responseType: "text",
+            headers,
+            validateStatus: () => true,
+        });
+
+        if (resp.status < 200 || resp.status >= 300) return h.response({ error: "Fetch failed" }).code(resp.status);
+
+        const body = resp.data || "";
+
+        if (!body.startsWith("#EXTM3U")) {
+            const streamUrl = `/api/proxy/stream?url=${url}` + (ref ? `&ref=${ref}` : "");
+            return h.redirect(streamUrl);
+        }
+
+        const urlRegex = /(URI="([^"]+)")|((^[^#\n\r].*)$)/gm;
+        const rewritten = body.replace(
+            urlRegex,
+            (match, uriAttribute, uriValue, segmentUrl) => {
+                const urlToRewrite = uriValue || segmentUrl;
+                if (!urlToRewrite) return match;
+
+                const absolute = new URL(urlToRewrite, playlistUrl).href;
+                const b64url = Buffer.from(absolute).toString("base64");
+                const b64ref = referer ? Buffer.from(referer).toString("base64") : undefined;
+
+                let proxiedUrl: string;
+                const isPlaylist = urlToRewrite.match(/\.m3u8($|\?)/i);
+                const isSegment = urlToRewrite.match(/\.ts($|\?)/i);
+
+                if (isPlaylist) {
+                    proxiedUrl = `/api/proxy?url=${b64url}` + (b64ref ? `&ref=${b64ref}` : "");
+                } else if (isSegment) {
+                    proxiedUrl = getProxiedUrl(absolute, referer);
+                } else {
+                    proxiedUrl = getProxiedUrl(absolute, referer);
+                }
+
+                if (uriValue) return `URI="${proxiedUrl}"`;
+                return proxiedUrl;
+            }
+        );
+
+        return h.response(rewritten).type("application/vnd.apple.mpegurl").header("Cache-Control", "no-cache");
+    } catch (err: any) {
+        console.error("[/proxy] error:", err?.message || err);
+        return h.response({ error: "Proxy failed" }).code(500);
+    }
+};
