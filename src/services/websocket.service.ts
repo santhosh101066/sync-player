@@ -167,7 +167,10 @@ export class WebSocketService {
                     if (msg.type === 'kick-user' && sender.isAdmin) {
                         const target = this.clients.get(msg.targetId);
                         if (target && target.ws.readyState === WebSocket.OPEN) {
-                            target.ws.close();
+                            target.ws.send(JSON.stringify({ type: 'kick' }));
+                            setTimeout(() => {
+                                target.ws.close();
+                            }, 100);
                             this.clients.delete(msg.targetId);
                             this.broadcastUserList();
                         }
