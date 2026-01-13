@@ -26,9 +26,7 @@ const init = async () => {
 
     // We need to access the underlying node http server to handle upgrades
     if (server.listener) {
-        server.listener.on('upgrade', (req, socket, head) => {
-            wsService.handleUpgrade(req, socket, head);
-        });
+        wsService.attach(server.listener);
     }
 
     await server.start();
