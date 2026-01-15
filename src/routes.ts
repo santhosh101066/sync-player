@@ -2,6 +2,7 @@ import { ServerRoute } from "@hapi/hapi";
 import path from "path";
 import { libraryHandler } from "./handlers/library.handler";
 import { proxyPlaylistHandler, proxyStreamHandler } from "./handlers/proxy.handler";
+import { uploadHandler } from "./handlers/upload.handler";
 
 export const routes: ServerRoute[] = [
     // A. Library API (Scans /downloads folder)
@@ -43,6 +44,32 @@ export const routes: ServerRoute[] = [
                 path: path.join(process.cwd(), 'public'),
                 redirectToSlash: true,
                 index: true,
+            },
+        },
+    },
+    // F. Image Upload API
+    {
+        method: "POST",
+        path: "/api/upload",
+        options: {
+            payload: {
+                maxBytes: 10485760, // 10MB
+                output: 'stream',
+                parse: true,
+                multipart: true
+            }
+        },
+        handler: uploadHandler
+    },
+    // G. Serve Uploaded Images
+    {
+        method: "GET",
+        path: "/uploads/{param*}",
+        handler: {
+            directory: {
+                path: path.join(process.cwd(), 'uploads'),
+                redirectToSlash: true,
+                index: false,
             },
         },
     }

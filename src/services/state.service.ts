@@ -34,6 +34,15 @@ try {
     if (fs.existsSync(STATE_FILE)) {
         const raw = fs.readFileSync(STATE_FILE, 'utf-8');
         loadedState = { ...defaultState, ...JSON.parse(raw) };
+
+        // FIX: If state was playing, force pause and reset timestamp to prevent "huge elapsed time" jump
+        if (!loadedState.currentVideoState.paused) {
+            console.log("⚠️ State was playing. Forcing PAUSE and resetting timestamp to avoid sync jumps.");
+            loadedState.currentVideoState.paused = true;
+        }
+        // Always refresh timestamp on boot so 'elapsed' starts fresh
+        loadedState.currentVideoState.timestamp = Date.now();
+
         console.log("💾 State loaded from disk");
     }
 } catch (e) {

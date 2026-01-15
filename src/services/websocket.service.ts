@@ -1,6 +1,20 @@
 import { Server as HttpServer } from "http";
 import { Server, Socket } from "socket.io";
+import { OAuth2Client } from 'google-auth-library';
 import { persistState, serverState } from "./state.service";
+import { logger } from "./logger.service";
+import axios from "axios";
+import fs from "fs";
+import path from "path";
+
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ""; // [UPDATE THIS]
+
+if (!GOOGLE_CLIENT_ID) {
+    logger.warn("⚠️ WARNING: GOOGLE_CLIENT_ID is missing in .env file!");
+}
+
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 // Define the Client interface
 interface Client {
@@ -8,7 +22,8 @@ interface Client {
     nick: string;
     isAdmin: boolean;
     isMuted: boolean;
-    userId: number; 
+    userId: number;
+    picture?: string;
 }
 
 // Define structure for stored messages
@@ -19,21 +34,58 @@ interface StoredChatMessage {
     isAdmin: boolean;
     isSystem: boolean;
     timestamp: number;
+    picture?: string;
+    image?: string;
 }
 
 export class WebSocketService {
     private io: Server | undefined;
     private clients = new Map<string, Client>();
-    
+
     // 1. CHAT HISTORY STORAGE
     private chatHistory: StoredChatMessage[] = [];
     private readonly MAX_HISTORY = 50; // Keep last 50 messages
+
+    private async cacheProfileImage(url: string, userId: string): Promise<string> {
+        try {
+            const uploadDir = path.join(process.cwd(), 'uploads');
+            if (!fs.existsSync(uploadDir)) {
+                fs.mkdirSync(uploadDir, { recursive: true });
+            }
+
+            const filename = `profile-${userId}.jpg`;
+            const filePath = path.join(uploadDir, filename);
+            const publicUrl = `/uploads/${filename}`;
+
+            // Check if already cached (optional: could check age)
+            if (fs.existsSync(filePath)) {
+                return publicUrl;
+            }
+
+            const response = await axios({
+                url,
+                method: 'GET',
+                responseType: 'stream'
+            });
+
+            const writer = fs.createWriteStream(filePath);
+            response.data.pipe(writer);
+
+            return new Promise((resolve, reject) => {
+                writer.on('finish', () => resolve(publicUrl));
+                writer.on('error', reject);
+            });
+        } catch (error) {
+            logger.error(`Failed to cache profile image: ${error}`);
+            return url; // Fallback to original URL
+        }
+    }
 
     public attach(httpServer: HttpServer) {
         this.io = new Server(httpServer, {
             cors: { origin: "*", methods: ["GET", "POST"] },
             transports: ['polling', 'websocket'],
-            maxHttpBufferSize: 1e6 
+            maxHttpBufferSize: 1e6
         });
 
         this.setupSocketIO();
@@ -54,7 +106,7 @@ export class WebSocketService {
             };
             this.clients.set(socket.id, client);
 
-            console.log(`[Connect] ${client.nick} (${socket.id})`);
+            logger.info(`[Connect] ${client.nick} (${socket.id})`);
 
             socket.emit("message", { type: 'welcome', userId });
 
@@ -66,9 +118,9 @@ export class WebSocketService {
 
             // 2. SEND HISTORY ON CONNECT
             if (this.chatHistory.length > 0) {
-                socket.emit("message", { 
-                    type: 'chat-history', 
-                    messages: this.chatHistory 
+                socket.emit("message", {
+                    type: 'chat-history',
+                    messages: this.chatHistory
                 });
             }
 
@@ -96,7 +148,7 @@ export class WebSocketService {
                 try {
                     this.handleMessage(socket, msg);
                 } catch (e) {
-                    console.error("Message Processing Error:", e);
+                    logger.error(`Message Processing Error: ${e}`);
                 }
             });
 
@@ -117,18 +169,88 @@ export class WebSocketService {
         });
     }
 
-    private handleMessage(socket: Socket, msg: any) {
+    private async handleMessage(socket: Socket, msg: any) {
         const sender = this.clients.get(socket.id);
         if (!sender) return;
 
+        if (msg.type === 'auth-google') {
+            try {
+                const ticket = await googleClient.verifyIdToken({
+                    idToken: msg.token,
+                    audience: GOOGLE_CLIENT_ID,
+                });
+                const payload = ticket.getPayload();
+
+                if (payload) {
+                    logger.info(`[Auth] Payload: name='${payload.name}', given='${payload.given_name}', mail='${payload.email}', pic='${!!payload.picture}'`);
+
+                    // Fix: Use name -> given_name -> email part
+                    sender.nick = payload.name || payload.given_name || payload.email?.split('@')[0] || "Google User";
+
+                    if (payload.picture) {
+                        sender.picture = await this.cacheProfileImage(payload.picture, payload.sub);
+                    } else {
+                        sender.picture = undefined;
+                    }
+
+                    // Optional: Auto-make specific emails Admin
+                    const adminEmail = process.env.ADMIN_EMAIL;
+                    if (adminEmail && payload.email === adminEmail) {
+                        sender.isAdmin = true;
+                        socket.emit("message", { type: 'admin-success' });
+                    }
+
+                    logger.info(`[Auth] Verified: ${sender.nick}`);
+                    this.broadcastUserList();
+
+                    // Send welcome/state just like 'identify'
+                    socket.emit("message", {
+                        type: 'system-state',
+                        userControlsAllowed: serverState.areUserControlsAllowed,
+                        proxyEnabled: serverState.isProxyEnabled
+                    });
+
+                    // Notify others
+                    socket.broadcast.emit("message", {
+                        type: 'chat',
+                        nick: 'System',
+                        text: `${sender.nick} logged in with Google`,
+                        isSystem: true
+                    });
+
+                    // 4. Send Video Sync (Force Sync) - MATCHING IDENTIFY LOGIC
+                    if (serverState.currentVideoState.url) {
+                        let estimatedTime = serverState.currentVideoState.time;
+                        if (!serverState.currentVideoState.paused) {
+                            const elapsed = (Date.now() - serverState.currentVideoState.timestamp) / 1000;
+                            estimatedTime += elapsed;
+                        }
+
+                        logger.info(`[Auth] Sending forceSync at ${estimatedTime.toFixed(1)}s`);
+
+                        socket.emit("message", {
+                            type: 'forceSync',
+                            url: serverState.currentVideoState.url,
+                            time: estimatedTime,
+                            paused: serverState.currentVideoState.paused
+                        });
+                    }
+                }
+            } catch (error) {
+                logger.error(`Google Auth Failed: ${error}`);
+                socket.emit("message", { type: 'error', text: "Authentication failed" });
+            }
+            return;
+        }
+
         if (msg.type === 'identify') {
             sender.nick = msg.nick || `User ${sender.userId}`;
-            
+
             // Log to terminal to verify this code runs
-            console.log(`[Identify] User joined: ${sender.nick}`);
+            logger.info(`[Identify] User joined: ${sender.nick}`);
 
             this.broadcastUserList();
-            
+
             // 1. Notify others
             socket.broadcast.emit("message", {
                 type: 'chat',
@@ -146,18 +268,18 @@ export class WebSocketService {
 
             // 3. Send Video Sync (Force Sync)
             // Log the current URL to check if state was wiped
-            console.log(`[Identify] Checking sync state. URL: '${serverState.currentVideoState.url}'`);
-            
+            logger.info(`[Identify] Checking sync state. URL: '${serverState.currentVideoState.url}'`);
+
             if (serverState.currentVideoState.url) {
                 let estimatedTime = serverState.currentVideoState.time;
-                
+
                 // Calculate elapsed time if video is playing
                 if (!serverState.currentVideoState.paused) {
                     const elapsed = (Date.now() - serverState.currentVideoState.timestamp) / 1000;
                     estimatedTime += elapsed;
                 }
-                
-                console.log(`[Identify] Sending forceSync at ${estimatedTime.toFixed(1)}s`);
+
+                logger.info(`[Identify] Sending forceSync at ${estimatedTime.toFixed(1)}s`);
 
                 socket.emit("message", {
                     type: 'forceSync',
@@ -166,13 +288,13 @@ export class WebSocketService {
                     paused: serverState.currentVideoState.paused
                 });
             } else {
-                console.log("[Identify] No active video URL found in server memory.");
+                logger.info("[Identify] No active video URL found in server memory.");
             }
             return;
         }
 
         if (msg.type === 'admin-login') {
-            if (msg.password === 'admin123') { 
+            if (msg.password === process.env.ADMIN_PASSWORD || "") {
                 sender.isAdmin = true;
                 socket.emit("message", { type: 'admin-success' });
                 this.broadcastUserList();
@@ -195,7 +317,9 @@ export class WebSocketService {
                 text: msg.text,
                 isAdmin: sender.isAdmin,
                 isSystem: false,
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                picture: sender.picture,
+                image: msg.image
             };
 
             // 3. STORE MESSAGE IN MEMORY
@@ -262,6 +386,8 @@ export class WebSocketService {
                 };
                 persistState();
                 socket.broadcast.emit("message", msg);
+            } else {
+                logger.warn(`[Sync] Ignored sync from ${sender.nick} (Admin: ${sender.isAdmin}, Controls: ${serverState.areUserControlsAllowed})`);
             }
             return;
         }
@@ -279,7 +405,7 @@ export class WebSocketService {
             serverState.currentVideoState = {
                 url: msg.url,
                 time: 0,
-                paused: true, 
+                paused: true,
                 timestamp: Date.now()
             };
             persistState();
@@ -301,7 +427,8 @@ export class WebSocketService {
             id: c.userId,
             nick: c.nick,
             isAdmin: c.isAdmin,
-            isMuted: c.isMuted
+            isMuted: c.isMuted,
+            picture: c.picture
         }));
         this.io?.emit("message", { type: 'user-list', users: userList });
     }
@@ -311,21 +438,23 @@ export class WebSocketService {
             id: c.userId,
             nick: c.nick,
             isAdmin: c.isAdmin,
-            isMuted: c.isMuted
+            isMuted: c.isMuted,
+            picture: c.picture
         }));
         socket.emit("message", { type: 'user-list', users: userList });
     }
 
-    private broadcastChat(nick: string, text: string, isSystem = false) {
+    private broadcastChat(nick: string, text: string, isSystem = false, image?: string) {
         const msg: StoredChatMessage = {
             type: 'chat',
             nick,
             text,
             isSystem,
             isAdmin: false,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            image
         };
-        
+
         // Save System announcements to history
         this.chatHistory.push(msg);
         if (this.chatHistory.length > this.MAX_HISTORY) this.chatHistory.shift();

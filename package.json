@@ -12,8 +12,10 @@
     "@hapi/hapi": "^21.3.2",
     "@hapi/inert": "^7.1.0",
     "axios": "^1.6.2",
+    "dotenv": "^17.2.3",
     "google-auth-library": "^10.5.0",
-    "socket.io": "^4.8.3"
+    "socket.io": "^4.8.3",
+    "winston": "^3.19.0"
   },
   "devDependencies": {
     "@types/hapi__hapi": "^20.0.13",

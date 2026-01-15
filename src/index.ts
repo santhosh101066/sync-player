@@ -1,6 +1,8 @@
+import "dotenv/config";
 import Hapi from "@hapi/hapi";
 import Inert from "@hapi/inert";
 import { WebSocketService } from "./services/websocket.service";
+import { logger } from "./services/logger.service";
 import { routes } from "./routes";
 
 const init = async () => {
@@ -14,6 +16,10 @@ const init = async () => {
             },
             files: {
                 relativeTo: process.cwd()
+            },
+            state: {
+                parse: true,
+                failAction: 'ignore'
             }
         },
     });
@@ -30,12 +36,12 @@ const init = async () => {
     }
 
     await server.start();
-    console.log("🚀 SyncStream running on %s", server.info.uri);
-    console.log("📂 Drop videos in: %s/downloads/", process.cwd());
+    logger.info(`🚀 SyncStream running on ${server.info.uri}`);
+    logger.info(`📂 Drop videos in: ${process.cwd()}/downloads/`);
 };
 
 process.on("unhandledRejection", (err) => {
-    console.log(err);
+    logger.error(err);
     process.exit(1);
 });
 

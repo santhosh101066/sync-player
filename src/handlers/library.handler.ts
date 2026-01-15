@@ -11,7 +11,9 @@ export const libraryHandler = async (request: Request, h: ResponseToolkit) => {
         }
         const files = await fs.promises.readdir(dir);
         // Filter for common video formats
-        return files.filter(f => /\.(mp4|mkv|webm|m3u8)$/i.test(f));
+        const validFiles = files.filter(f => /\.(mp4|mkv|webm|m3u8)$/i.test(f));
+        console.log(`[Library] Scanned ${files.length} files. Returning ${validFiles.length} valid videos.`);
+        return validFiles;
     } catch (e) {
         console.error("Library scan error:", e);
         return [];
