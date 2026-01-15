@@ -45,3 +45,4 @@ next-env.d.ts
 downloads
 dist
 uploads
+server-state.json
