@@ -24,6 +24,7 @@ interface Client {
     isMuted: boolean;
     userId: number;
     picture?: string;
+    isAuthenticated: boolean;
 }
 
 // Define structure for stored messages
@@ -102,7 +103,8 @@ export class WebSocketService {
                 nick: `User ${userId}`,
                 isAdmin: false,
                 isMuted: false,
-                userId
+                userId,
+                isAuthenticated: false
             };
             this.clients.set(socket.id, client);
 
@@ -184,6 +186,8 @@ export class WebSocketService {
                 if (payload) {
                     logger.info(`[Auth] Payload: name='${payload.name}', given='${payload.given_name}', mail='${payload.email}', pic='${!!payload.picture}'`);
 
+                    sender.isAuthenticated = true;
+
                     // Fix: Use name -> given_name -> email part
                     sender.nick = payload.name || payload.given_name || payload.email?.split('@')[0] || "Google User";
 
@@ -204,6 +208,12 @@ export class WebSocketService {
                     this.broadcastUserList();
 
                     // Send welcome/state just like 'identify'
+                    socket.emit("message", {
+                        type: 'auth-success',
+                        nick: sender.nick,
+                        picture: sender.picture
+                    });
+
                     socket.emit("message", {
                         type: 'system-state',
                         userControlsAllowed: serverState.areUserControlsAllowed,
@@ -243,71 +253,6 @@ export class WebSocketService {
             return;
         }
 
-        if (msg.type === 'identify') {
-            sender.nick = msg.nick || `User ${sender.userId}`;
-
-            // Log to terminal to verify this code runs
-            logger.info(`[Identify] User joined: ${sender.nick}`);
-
-            this.broadcastUserList();
-
-            // 1. Notify others
-            socket.broadcast.emit("message", {
-                type: 'chat',
-                nick: 'System',
-                text: `${sender.nick} joined the session`,
-                isSystem: true
-            });
-
-            // 2. Send System State (Permissions)
-            socket.emit("message", {
-                type: 'system-state',
-                userControlsAllowed: serverState.areUserControlsAllowed,
-                proxyEnabled: serverState.isProxyEnabled
-            });
-
-            // 3. Send Video Sync (Force Sync)
-            // Log the current URL to check if state was wiped
-            logger.info(`[Identify] Checking sync state. URL: '${serverState.currentVideoState.url}'`);
-
-            if (serverState.currentVideoState.url) {
-                let estimatedTime = serverState.currentVideoState.time;
-
-                // Calculate elapsed time if video is playing
-                if (!serverState.currentVideoState.paused) {
-                    const elapsed = (Date.now() - serverState.currentVideoState.timestamp) / 1000;
-                    estimatedTime += elapsed;
-                }
-
-                logger.info(`[Identify] Sending forceSync at ${estimatedTime.toFixed(1)}s`);
-
-                socket.emit("message", {
-                    type: 'forceSync',
-                    url: serverState.currentVideoState.url,
-                    time: estimatedTime,
-                    paused: serverState.currentVideoState.paused
-                });
-            } else {
-                logger.info("[Identify] No active video URL found in server memory.");
-            }
-            return;
-        }
-
-        if (msg.type === 'admin-login') {
-            if (msg.password === process.env.ADMIN_PASSWORD || "") {
-                sender.isAdmin = true;
-                socket.emit("message", { type: 'admin-success' });
-                this.broadcastUserList();
-                socket.emit("message", {
-                    type: 'system-state',
-                    userControlsAllowed: serverState.areUserControlsAllowed,
-                    proxyEnabled: serverState.isProxyEnabled
-                });
-            } else {
-                socket.emit("message", { type: 'admin-fail' });
-            }
-            return;
-        }
 
         // --- CHAT HANDLING ---
         if (msg.type === 'chat') {

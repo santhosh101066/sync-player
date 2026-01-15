@@ -35,12 +35,14 @@ try {
         const raw = fs.readFileSync(STATE_FILE, 'utf-8');
         loadedState = { ...defaultState, ...JSON.parse(raw) };
 
-        // FIX: If state was playing, force pause and reset timestamp to prevent "huge elapsed time" jump
+        // If state was playing, calculate elapsed time since crash/restart so we resume at the correct point
         if (!loadedState.currentVideoState.paused) {
-            console.log("⚠️ State was playing. Forcing PAUSE and resetting timestamp to avoid sync jumps.");
-            loadedState.currentVideoState.paused = true;
+            const elapsed = (Date.now() - loadedState.currentVideoState.timestamp) / 1000;
+            loadedState.currentVideoState.time += elapsed;
+            console.log(`▶ Resuming playback. Advanced time by ${elapsed.toFixed(1)}s`);
         }
-        // Always refresh timestamp on boot so 'elapsed' starts fresh
+
+        // Always refresh timestamp on boot so future 'elapsed' calcs are relative to NOW
         loadedState.currentVideoState.timestamp = Date.now();
 
         console.log("💾 State loaded from disk");
