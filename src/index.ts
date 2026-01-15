@@ -9,7 +9,7 @@ const init = async () => {
         host: "0.0.0.0",
         routes: {
             cors: {
-                origin: ["*"],
+                origin: ["http://localhost:5173", "http://localhost:8000"],
                 additionalHeaders: ["cache-control", "x-requested-with"]
             },
             files: {

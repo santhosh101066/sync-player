@@ -1,6 +1,6 @@
 import { Server as HttpServer } from "http";
 import { Server, Socket } from "socket.io";
-import { serverState } from "./state.service";
+import { persistState, serverState } from "./state.service";
 
 // Define the Client interface
 interface Client {
@@ -123,15 +123,51 @@ export class WebSocketService {
 
         if (msg.type === 'identify') {
             sender.nick = msg.nick || `User ${sender.userId}`;
+            
+            // Log to terminal to verify this code runs
+            console.log(`[Identify] User joined: ${sender.nick}`);
+
             this.broadcastUserList();
             
-            // We do NOT save "User joined" to history
+            // 1. Notify others
             socket.broadcast.emit("message", {
                 type: 'chat',
                 nick: 'System',
                 text: `${sender.nick} joined the session`,
                 isSystem: true
             });
+
+            // 2. Send System State (Permissions)
+            socket.emit("message", {
+                type: 'system-state',
+                userControlsAllowed: serverState.areUserControlsAllowed,
+                proxyEnabled: serverState.isProxyEnabled
+            });
+
+            // 3. Send Video Sync (Force Sync)
+            // Log the current URL to check if state was wiped
+            console.log(`[Identify] Checking sync state. URL: '${serverState.currentVideoState.url}'`);
+            
+            if (serverState.currentVideoState.url) {
+                let estimatedTime = serverState.currentVideoState.time;
+                
+                // Calculate elapsed time if video is playing
+                if (!serverState.currentVideoState.paused) {
+                    const elapsed = (Date.now() - serverState.currentVideoState.timestamp) / 1000;
+                    estimatedTime += elapsed;
+                }
+                
+                console.log(`[Identify] Sending forceSync at ${estimatedTime.toFixed(1)}s`);
+
+                socket.emit("message", {
+                    type: 'forceSync',
+                    url: serverState.currentVideoState.url,
+                    time: estimatedTime,
+                    paused: serverState.currentVideoState.paused
+                });
+            } else {
+                console.log("[Identify] No active video URL found in server memory.");
+            }
             return;
         }
 
@@ -175,6 +211,7 @@ export class WebSocketService {
 
         if (msg.type === 'toggle-user-controls' && sender.isAdmin) {
             serverState.areUserControlsAllowed = !!msg.value;
+            persistState(); // <--- SAVE
             this.broadcastSystemState();
             this.broadcastChat('System', serverState.areUserControlsAllowed ? '🔓 User controls enabled' : '🔒 User controls disabled', true);
             return;
@@ -182,6 +219,7 @@ export class WebSocketService {
 
         if (msg.type === 'toggle-proxy' && sender.isAdmin) {
             serverState.isProxyEnabled = !!msg.value;
+            persistState(); // <--- SAVE
             this.broadcastSystemState();
             this.broadcastChat('System', serverState.isProxyEnabled ? '📡 Proxy Mode ENABLED' : '🔌 Proxy Mode DISABLED', true);
             return;
@@ -222,6 +260,7 @@ export class WebSocketService {
                     paused: msg.paused,
                     timestamp: Date.now()
                 };
+                persistState();
                 socket.broadcast.emit("message", msg);
             }
             return;
@@ -240,9 +279,10 @@ export class WebSocketService {
             serverState.currentVideoState = {
                 url: msg.url,
                 time: 0,
-                paused: false, 
+                paused: true, 
                 timestamp: Date.now()
             };
+            persistState();
             this.io?.emit("message", { type: 'load', url: msg.url });
             return;
         }

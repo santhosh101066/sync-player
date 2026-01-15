@@ -2,8 +2,36 @@ import { Request, ResponseToolkit } from "@hapi/hapi";
 import axios from "axios";
 import { assertHttpUrl, getProxiedUrl } from "../utils/url.utils";
 import { IncomingMessage } from "http";
+import { serverState } from "../services/state.service"; // [cite: 238] Import state
+
+// --- HELPER: Security Check ---
+const validateRequest = (request: Request) => {
+    // 1. Check Global Switch
+    if (!serverState.isProxyEnabled) {
+        return { valid: false, error: "Proxy is disabled by Admin", code: 403 };
+    }
+
+    // 2. Referer Guard (Anti-Hotlink)
+    // We expect requests to come from our own frontend (UI).
+    // If a request has NO referer, it might be a direct script or bot.
+    // However, some privacy browsers block Referer, so we permit "undefined" for now,
+    // but strictly block if the referer exists and doesn't match our host.
+    const reqReferer = request.headers.referer;
+    const host = request.info.host; // e.g., "localhost:8000" or "mysite.com"
+    
+    // If Referer exists, it MUST contain our host.
+    if (reqReferer && !reqReferer.includes(host)) {
+        return { valid: false, error: "Unauthorized Referer", code: 403 };
+    }
+
+    return { valid: true };
+};
 
 export const proxyStreamHandler = async (request: Request, h: ResponseToolkit) => {
+    // [SECURITY STEP] Validate before processing
+    const check = validateRequest(request);
+    if (!check.valid) return h.response({ error: check.error }).code(check.code!);
+
     const { url, ref } = request.query;
     if (!url) return h.response({ error: 'No URL' }).code(400);
 
@@ -25,15 +53,12 @@ export const proxyStreamHandler = async (request: Request, h: ResponseToolkit) =
             validateStatus: () => true,
             decompress: false,
         });
-
         const stream = response.data as IncomingMessage;
         const hapiResponse = h.response(stream).code(response.status);
-
         const headersToCopy = [
             'content-type', 'content-length', 'accept-ranges',
             'content-range', 'date', 'last-modified', 'etag',
         ];
-
         for (const [key, value] of Object.entries(response.headers)) {
             if (value && headersToCopy.includes(key.toLowerCase())) {
                 hapiResponse.header(key, value.toString());
@@ -47,6 +72,10 @@ export const proxyStreamHandler = async (request: Request, h: ResponseToolkit) =
 };
 
 export const proxyPlaylistHandler = async (request: Request, h: ResponseToolkit) => {
+    // [SECURITY STEP] Validate before processing
+    const check = validateRequest(request);
+    if (!check.valid) return h.response({ error: check.error }).code(check.code!);
+
     try {
         const { url, ref } = request.query;
         if (!url) return h.response({ error: "No URL" }).code(400);
@@ -68,17 +97,15 @@ export const proxyPlaylistHandler = async (request: Request, h: ResponseToolkit)
             headers,
             validateStatus: () => true,
         });
-
         if (resp.status < 200 || resp.status >= 300) return h.response({ error: "Fetch failed" }).code(resp.status);
 
         const body = resp.data || "";
-
         if (!body.startsWith("#EXTM3U")) {
             const streamUrl = `/api/proxy/stream?url=${url}` + (ref ? `&ref=${ref}` : "");
             return h.redirect(streamUrl);
         }
 
-        const urlRegex = /(URI="([^"]+)")|((^[^#\n\r].*)$)/gm;
+        const urlRegex = /(URI=["']([^"']+)["'])|((^\s*[^#\n\r].*)$)/gm;
         const rewritten = body.replace(
             urlRegex,
             (match, uriAttribute, uriValue, segmentUrl) => {
