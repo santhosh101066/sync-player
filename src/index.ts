@@ -1,6 +1,7 @@
 import "dotenv/config";
 import Hapi from "@hapi/hapi";
 import Inert from "@hapi/inert";
+import path from "path";
 import { WebSocketService } from "./services/websocket.service";
 import { logger } from "./services/logger.service";
 import { routes } from "./routes";
@@ -26,6 +27,15 @@ const init = async () => {
 
     await server.register(Inert);
     server.route(routes);
+
+    // SPA Fallback: Serve index.html for 404s on non-API routes
+    server.ext('onPreResponse', (request, h) => {
+        const response = request.response;
+        if ((response as any).isBoom && (response as any).output.statusCode === 404 && request.method === 'get' && !request.path.startsWith('/api')) {
+            return h.file(path.join(process.cwd(), 'public', 'index.html'));
+        }
+        return h.continue;
+    });
 
     // Initialize WebSocket Service which attaches to the server listener
     const wsService = new WebSocketService();
