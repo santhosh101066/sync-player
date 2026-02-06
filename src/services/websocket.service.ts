@@ -86,7 +86,9 @@ export class WebSocketService {
         this.io = new Server(httpServer, {
             cors: { origin: "*", methods: ["GET", "POST"] },
             transports: ['polling', 'websocket'],
-            maxHttpBufferSize: 1e6
+            maxHttpBufferSize: 1e6,
+            pingInterval: 10000, // Send a ping every 10 seconds
+            pingTimeout: 5000    // Wait 5 seconds for a pong
         });
 
         this.setupSocketIO();
@@ -211,7 +213,8 @@ export class WebSocketService {
                     socket.emit("message", {
                         type: 'auth-success',
                         nick: sender.nick,
-                        picture: sender.picture
+                        picture: sender.picture,
+                        email: payload.email
                     });
 
                     socket.emit("message", {

@@ -46,3 +46,7 @@ downloads
 dist
 uploads
 server-state.json
+cookies.txt
+android*
+ios*
+debug*

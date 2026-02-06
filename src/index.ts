@@ -12,8 +12,8 @@ const init = async () => {
         host: "0.0.0.0",
         routes: {
             cors: {
-                origin: ["http://localhost:5173", "http://localhost:8000"],
-                additionalHeaders: ["cache-control", "x-requested-with"]
+                origin: ['*'], // Allow all origins for development
+                additionalHeaders: ["cache-control", "x-requested-with", "x-admin-token"]
             },
             files: {
                 relativeTo: process.cwd()
@@ -21,8 +21,22 @@ const init = async () => {
             state: {
                 parse: true,
                 failAction: 'ignore'
+            },
+            payload: {
+                maxBytes: 524288000, // 500MB for large video chunks
+                timeout: false // Disable timeout for long video streams
+            },
+            timeout: {
+                socket: false, // Disable socket timeout for streaming
+                server: false  // Disable server timeout
             }
         },
+        load: {
+            sampleInterval: 1000,
+            maxHeapUsedBytes: 0,
+            maxRssBytes: 0,
+            maxEventLoopDelay: 0
+        }
     });
 
     await server.register(Inert);

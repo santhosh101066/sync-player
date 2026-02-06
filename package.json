@@ -5,18 +5,22 @@
   "main": "src/index.ts",
   "scripts": {
     "start": "ts-node src/index.ts",
-    "dev": "nodemon --watch 'src/**/*.ts' --exec 'ts-node' src/index.ts",
+    "start:cluster": "ts-node src/cluster.ts",
+    "dev": "rm -f *-player-script.js && nodemon --watch 'src/**/*.ts' --exec 'ts-node' src/index.ts",
     "build": "tsc",
     "test:load": "ts-node scripts/load-test.ts"
   },
   "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
     "@hapi/hapi": "^21.3.2",
     "@hapi/inert": "^7.1.0",
     "axios": "^1.6.2",
     "dotenv": "^17.2.3",
     "google-auth-library": "^10.5.0",
     "socket.io": "^4.8.3",
-    "winston": "^3.19.0"
+    "winston": "^3.19.0",
+    "youtube-dl-exec": "^3.0.30",
+    "yt-search": "^2.13.1"
   },
   "devDependencies": {
     "@types/hapi__hapi": "^20.0.13",
