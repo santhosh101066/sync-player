@@ -3,6 +3,7 @@ import { Server, Socket } from "socket.io";
 import { OAuth2Client } from 'google-auth-library';
 import { persistState, serverState } from "./state.service";
 import { logger } from "./logger.service";
+import { hashGoogleId } from "../utils/crypto.utils";
 import axios from "axios";
 import fs from "fs";
 import path from "path";
@@ -22,7 +23,8 @@ interface Client {
     nick: string;
     isAdmin: boolean;
     isMuted: boolean;
-    userId: number;
+    userId: string;  // Changed from number to string (hashed Google ID)
+    googleId?: string;  // Store original Google ID for reference
     picture?: string;
     isAuthenticated: boolean;
 }
@@ -98,21 +100,22 @@ export class WebSocketService {
         if (!this.io) return;
 
         this.io.on("connection", (socket: Socket) => {
-            const userId = Math.floor(Math.random() * 0xFFFFFFFF);
+            // Generate temporary ID until Google auth completes
+            const tempUserId = `temp_${socket.id}`;
 
             const client: Client = {
                 socket,
-                nick: `User ${userId}`,
+                nick: "Authenticating...",
                 isAdmin: false,
                 isMuted: false,
-                userId,
+                userId: tempUserId,
                 isAuthenticated: false
             };
             this.clients.set(socket.id, client);
 
             logger.info(`[Connect] ${client.nick} (${socket.id})`);
 
-            socket.emit("message", { type: 'welcome', userId });
+            socket.emit("message", { type: 'welcome', userId: tempUserId });
 
             socket.emit("message", {
                 type: 'system-state',
@@ -188,6 +191,33 @@ export class WebSocketService {
                 if (payload) {
                     logger.info(`[Auth] Payload: name='${payload.name}', given='${payload.given_name}', mail='${payload.email}', pic='${!!payload.picture}'`);
 
+                    // Generate unique userId from Google ID
+                    const hashedUserId = hashGoogleId(payload.sub);
+
+                    // DEDUPLICATION: Check for existing connections with same Google ID
+                    let existingClient: Client | undefined;
+                    for (const [socketId, client] of this.clients) {
+                        if (client.userId === hashedUserId && socketId !== socket.id) {
+                            existingClient = client;
+                            logger.info(`[Dedup] Found existing session for ${payload.name} (${socketId})`);
+                            break;
+                        }
+                    }
+
+                    // If user already connected, disconnect old socket
+                    if (existingClient) {
+                        logger.info(`[Dedup] Disconnecting old session for ${payload.name}`);
+                        existingClient.socket.emit("message", {
+                            type: 'session-replaced',
+                            text: 'You have been logged in from another device/tab'
+                        });
+                        existingClient.socket.disconnect(true);
+                        this.clients.delete(existingClient.socket.id);
+                    }
+
+                    // Update current client with hashed ID
+                    sender.userId = hashedUserId;
+                    sender.googleId = payload.sub;
                     sender.isAuthenticated = true;
 
                     // Fix: Use name -> given_name -> email part
@@ -206,7 +236,7 @@ export class WebSocketService {
                         socket.emit("message", { type: 'admin-success' });
                     }
 
-                    logger.info(`[Auth] Verified: ${sender.nick}`);
+                    logger.info(`[Auth] Verified: ${sender.nick} (userId: ${hashedUserId.substring(0, 8)}...)`);
                     this.broadcastUserList();
 
                     // Send welcome/state just like 'identify'
