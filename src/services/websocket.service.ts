@@ -286,6 +286,82 @@ export class WebSocketService {
             return;
         }
 
+        if (msg.type === 'auth-dev') {
+            const devEmail = msg.email;
+            const adminEmail = process.env.ADMIN_EMAIL;
+
+            if (adminEmail && devEmail === adminEmail) {
+                const hashedUserId = hashGoogleId(devEmail); // Use email as ID source for consistent dev ID
+
+                // DEDUPLICATION: Check for existing connections
+                let existingClient: Client | undefined;
+                for (const [socketId, client] of this.clients) {
+                    if (client.userId === hashedUserId && socketId !== socket.id) {
+                        existingClient = client;
+                        break;
+                    }
+                }
+
+                if (existingClient) {
+                    existingClient.socket.emit("message", {
+                        type: 'session-replaced',
+                        text: 'Dev session replaced'
+                    });
+                    existingClient.socket.disconnect(true);
+                    this.clients.delete(existingClient.socket.id);
+                }
+
+                sender.userId = hashedUserId;
+                sender.googleId = devEmail;
+                sender.isAuthenticated = true;
+                sender.nick = "Dev Admin";
+                sender.isAdmin = true; // Always admin for dev auth with correct email
+                sender.picture = undefined;
+
+                logger.info(`[Auth-Dev] Verified: ${sender.nick} (${devEmail})`);
+                this.broadcastUserList();
+
+                socket.emit("message", {
+                    type: 'auth-success',
+                    nick: sender.nick,
+                    email: devEmail
+                });
+
+                socket.emit("message", { type: 'admin-success' });
+
+                socket.emit("message", {
+                    type: 'system-state',
+                    userControlsAllowed: serverState.areUserControlsAllowed,
+                    proxyEnabled: serverState.isProxyEnabled
+                });
+
+                socket.broadcast.emit("message", {
+                    type: 'chat',
+                    nick: 'System',
+                    text: `${sender.nick} logged in via Dev Auth`,
+                    isSystem: true
+                });
+
+                // Send Sync
+                if (serverState.currentVideoState.url) {
+                    let estimatedTime = serverState.currentVideoState.time;
+                    if (!serverState.currentVideoState.paused) {
+                        const elapsed = (Date.now() - serverState.currentVideoState.timestamp) / 1000;
+                        estimatedTime += elapsed;
+                    }
+                    socket.emit("message", {
+                        type: 'forceSync',
+                        url: serverState.currentVideoState.url,
+                        time: estimatedTime,
+                        paused: serverState.currentVideoState.paused
+                    });
+                }
+            } else {
+                socket.emit("message", { type: 'error', text: "Dev Authentication failed" });
+            }
+            return;
+        }
+
 
         // --- CHAT HANDLING ---
         if (msg.type === 'chat') {
