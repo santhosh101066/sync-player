@@ -29,6 +29,7 @@ interface Client {
     isAuthenticated: boolean;
     isReady: boolean;
     isBuffered?: boolean; // Track if client has buffered enough
+    paused: boolean; // Track individual user's playing state
 }
 
 // Define structure for stored messages
@@ -112,7 +113,8 @@ export class WebSocketService {
                 isMuted: false,
                 userId: tempUserId,
                 isAuthenticated: false,
-                isReady: false
+                isReady: false,
+                paused: true // Initialize as paused
             };
             this.clients.set(socket.id, client);
 
@@ -450,7 +452,13 @@ export class WebSocketService {
                     timestamp: Date.now()
                 };
                 persistState();
-                socket.broadcast.emit("message", msg);
+                // Use io.emit to send to EVERYONE (including sender) for forceSync
+                // Use broadcast for regular sync to avoid echo
+                if (msg.type === 'forceSync') {
+                    this.io?.emit("message", msg);
+                } else {
+                    socket.broadcast.emit("message", msg);
+                }
             } else {
                 logger.warn(`[Sync] Ignored sync from ${sender.nick} (Admin: ${sender.isAdmin}, Controls: ${serverState.areUserControlsAllowed})`);
             }
@@ -462,6 +470,15 @@ export class WebSocketService {
                 serverState.currentVideoState.time = msg.time;
                 serverState.currentVideoState.timestamp = Date.now();
                 serverState.currentVideoState.paused = msg.paused;
+
+                // Track individual user's playing state
+                const previousPaused = sender.paused;
+                sender.paused = msg.paused;
+
+                // Broadcast user list if state changed
+                if (previousPaused !== msg.paused) {
+                    this.broadcastUserList();
+                }
             }
             return;
         }
@@ -495,6 +512,12 @@ export class WebSocketService {
 
         if (msg.type === 'buffer-status') {
             sender.isBuffered = !!msg.buffered;
+            this.checkBufferStatus();
+            return;
+        }
+
+        if (msg.type === 'check-buffer' && sender.isAdmin) {
+            logger.info(`[BufferCheck] Manual re-check requested by ${sender.nick}`);
             this.checkBufferStatus();
             return;
         }
@@ -673,7 +696,8 @@ export class WebSocketService {
             isAdmin: c.isAdmin,
             isMuted: c.isMuted,
             isReady: c.isReady,
-            picture: c.picture
+            picture: c.picture,
+            paused: c.paused
         }));
         this.io?.emit("message", { type: 'user-list', users: userList });
     }
@@ -685,7 +709,8 @@ export class WebSocketService {
             isAdmin: c.isAdmin,
             isMuted: c.isMuted,
             isReady: c.isReady,
-            picture: c.picture
+            picture: c.picture,
+            paused: c.paused
         }));
         socket.emit("message", { type: 'user-list', users: userList });
     }
@@ -731,6 +756,7 @@ export class WebSocketService {
             return;
         }
 
+        let unreadyUsers: string[] = [];
         let allReady = true;
         let readyCount = 0;
         let totalCount = 0;
@@ -740,9 +766,17 @@ export class WebSocketService {
             totalCount++;
             if (!client.isBuffered) {
                 allReady = false;
+                unreadyUsers.push(client.nick);
             } else {
                 readyCount++;
             }
+        }
+
+        // If only one user, no need to wait - auto-play immediately
+        if (totalCount === 1) {
+            logger.info(`[BufferCheck] Only one user - skipping buffer sync, auto-playing immediately`);
+            allReady = true;
+            readyCount = 1;
         }
 
         // Broadcast progress to Admin
@@ -752,7 +786,8 @@ export class WebSocketService {
                 type: 'buffer-progress',
                 ready: readyCount,
                 total: totalCount,
-                allReady
+                allReady,
+                unreadyUsers // Send list of names
             });
             logger.info(`[BufferCheck] Ready: ${readyCount}/${totalCount} (${allReady ? 'ALL READY' : 'WAITING'})`);
         } else {
