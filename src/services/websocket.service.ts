@@ -27,6 +27,7 @@ interface Client {
     googleId?: string;  // Store original Google ID for reference
     picture?: string;
     isAuthenticated: boolean;
+    isReady: boolean;
 }
 
 // Define structure for stored messages
@@ -109,7 +110,8 @@ export class WebSocketService {
                 isAdmin: false,
                 isMuted: false,
                 userId: tempUserId,
-                isAuthenticated: false
+                isAuthenticated: false,
+                isReady: false
             };
             this.clients.set(socket.id, client);
 
@@ -244,7 +246,8 @@ export class WebSocketService {
                         type: 'auth-success',
                         nick: sender.nick,
                         picture: sender.picture,
-                        email: payload.email
+                        email: payload.email,
+                        userId: sender.userId // Send the new hashed ID
                     });
 
                     socket.emit("message", {
@@ -324,7 +327,8 @@ export class WebSocketService {
                 socket.emit("message", {
                     type: 'auth-success',
                     nick: sender.nick,
-                    email: devEmail
+                    email: devEmail,
+                    userId: sender.userId // Send the new hashed ID
                 });
 
                 socket.emit("message", { type: 'admin-success' });
@@ -455,7 +459,19 @@ export class WebSocketService {
             return;
         }
 
+        if (msg.type === 'ready') {
+            sender.isReady = !!msg.value;
+            this.broadcastUserList();
+            return;
+        }
+
         if (msg.type === 'load' && sender.isAdmin) {
+            // Reset everyone's ready state
+            for (const client of this.clients.values()) {
+                client.isReady = false;
+            }
+            this.broadcastUserList();
+
             serverState.currentVideoState = {
                 url: msg.url,
                 time: 0,
@@ -464,6 +480,11 @@ export class WebSocketService {
             };
             persistState();
             this.io?.emit("message", { type: 'load', url: msg.url });
+            return;
+        }
+
+        if (msg.type === 'ping') {
+            socket.emit("message", { type: 'pong', startTime: msg.startTime });
             return;
         }
     }
@@ -482,6 +503,7 @@ export class WebSocketService {
             nick: c.nick,
             isAdmin: c.isAdmin,
             isMuted: c.isMuted,
+            isReady: c.isReady,
             picture: c.picture
         }));
         this.io?.emit("message", { type: 'user-list', users: userList });
@@ -493,6 +515,7 @@ export class WebSocketService {
             nick: c.nick,
             isAdmin: c.isAdmin,
             isMuted: c.isMuted,
+            isReady: c.isReady,
             picture: c.picture
         }));
         socket.emit("message", { type: 'user-list', users: userList });

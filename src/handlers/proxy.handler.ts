@@ -2,7 +2,16 @@ import { Request, ResponseToolkit } from "@hapi/hapi";
 import axios from "axios";
 import { assertHttpUrl, getProxiedUrl } from "../utils/url.utils";
 import { IncomingMessage } from "http";
-import { serverState } from "../services/state.service"; // [cite: 238] Import state
+import { serverState } from "../services/state.service";
+import https from "https";
+
+// Re-use agent to keep connections alive for sequential segment fetches
+const agent = new https.Agent({
+    keepAlive: true,
+    maxSockets: 100,
+    maxFreeSockets: 10,
+    timeout: 60000
+});
 
 // --- HELPER: Security Check ---
 const validateRequest = (request: Request) => {
@@ -18,7 +27,7 @@ const validateRequest = (request: Request) => {
     // but strictly block if the referer exists and doesn't match our host.
     const reqReferer = request.headers.referer;
     const host = request.info.host; // e.g., "localhost:8000" or "mysite.com"
-    
+
     // If Referer exists, it MUST contain our host.
     if (reqReferer && !reqReferer.includes(host)) {
         return { valid: false, error: "Unauthorized Referer", code: 403 };
@@ -52,6 +61,8 @@ export const proxyStreamHandler = async (request: Request, h: ResponseToolkit) =
             headers: requestHeaders,
             validateStatus: () => true,
             decompress: false,
+            httpsAgent: agent, // Use keep-alive agent
+            timeout: 30000 // 30s timeout per segment
         });
         const stream = response.data as IncomingMessage;
         const hapiResponse = h.response(stream).code(response.status);
@@ -96,6 +107,8 @@ export const proxyPlaylistHandler = async (request: Request, h: ResponseToolkit)
             responseType: "text",
             headers,
             validateStatus: () => true,
+            httpsAgent: agent,
+            timeout: 10000 // 10s for playlist
         });
         if (resp.status < 200 || resp.status >= 300) return h.response({ error: "Fetch failed" }).code(resp.status);
 
