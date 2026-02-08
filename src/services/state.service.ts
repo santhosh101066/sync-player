@@ -55,8 +55,12 @@ try {
         if (!loadedState.currentVideoState.paused) {
             const elapsed = (Date.now() - loadedState.currentVideoState.timestamp) / 1000;
             loadedState.currentVideoState.time += elapsed;
-            console.log(`▶ Resuming playback. Advanced time by ${elapsed.toFixed(1)}s`);
+            console.log(`▶ Was playing before restart. Advanced time by ${elapsed.toFixed(1)}s`);
         }
+
+        // Always reset to paused on server restart - videos need to be re-buffered
+        loadedState.currentVideoState.paused = true;
+        console.log(`⏸️  Reset paused=true (server restart requires re-buffering)`);
 
         // Always refresh timestamp on boot so future 'elapsed' calcs are relative to NOW
         loadedState.currentVideoState.timestamp = Date.now();

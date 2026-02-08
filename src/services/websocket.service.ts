@@ -444,13 +444,25 @@ export class WebSocketService {
         }
 
         if (msg.type === 'sync' || msg.type === 'forceSync') {
+            logger.info(`[${msg.type}] Received - url=${msg.url?.substring(msg.url.length - 11)}, time=${msg.time}, paused=${msg.paused}`);
+
             if (sender.isAdmin || serverState.areUserControlsAllowed) {
+                const isNewVideo = msg.url && msg.url !== serverState.currentVideoState.url;
+
                 serverState.currentVideoState = {
                     url: msg.url || serverState.currentVideoState.url,
                     time: msg.time,
-                    paused: msg.paused,
+                    // If new video, force paused=true for buffer sync. Otherwise use msg.paused
+                    paused: isNewVideo ? true : msg.paused,
                     timestamp: Date.now()
                 };
+
+                if (isNewVideo) {
+                    logger.info(`[Sync] New video detected - forcing paused=true for buffer sync`);
+                } else {
+                    logger.info(`[Sync] Same video - using paused=${msg.paused} from message`);
+                }
+
                 persistState();
                 // Use io.emit to send to EVERYONE (including sender) for forceSync
                 // Use broadcast for regular sync to avoid echo
@@ -467,9 +479,27 @@ export class WebSocketService {
 
         if (msg.type === 'timeUpdate') {
             if (sender.isAdmin || serverState.areUserControlsAllowed) {
+                const prevPausedState = serverState.currentVideoState.paused;
+                const incomingTime = msg.time;
+
                 serverState.currentVideoState.time = msg.time;
                 serverState.currentVideoState.timestamp = Date.now();
-                serverState.currentVideoState.paused = msg.paused;
+
+                // Don't let timeUpdate set paused=false during initial buffer sync
+                // Use INCOMING time (msg.time), not updated serverState.time
+                // Block paused=false when incoming time < 1s (buffer sync)
+                // Allow paused=true at any time (for manual pause)
+                const canUpdatePaused = incomingTime > 1.0 || msg.paused === true;
+
+                if (canUpdatePaused) {
+                    serverState.currentVideoState.paused = msg.paused;
+                    if (prevPausedState !== msg.paused) {
+                        logger.info(`[TimeUpdate] Paused state changed: ${prevPausedState} → ${msg.paused} (time=${incomingTime.toFixed(2)}s)`);
+                    }
+                } else if (msg.paused === false && incomingTime < 1.0) {
+                    // Log when we block paused=false during buffer sync
+                    logger.info(`[TimeUpdate] Blocked paused=false at time=${incomingTime.toFixed(2)}s (keeping paused=${prevPausedState})`);
+                }
 
                 // Track individual user's playing state
                 const previousPaused = sender.paused;
@@ -490,10 +520,13 @@ export class WebSocketService {
         }
 
         if (msg.type === 'load' && sender.isAdmin) {
-            // Reset everyone's ready/buffer state
+            logger.info(`[Load] Resetting state for new video: ${msg.url}`);
+
+            // Reset everyone's ready/buffer/paused state for new video
             for (const client of this.clients.values()) {
                 client.isReady = false;
                 client.isBuffered = false;
+                client.paused = true; // Reset to paused state
             }
             this.broadcastUserList();
 
@@ -504,6 +537,9 @@ export class WebSocketService {
                 timestamp: Date.now()
             };
             persistState();
+
+            logger.info(`[Load] Server state reset - paused=true, time=0`);
+
             this.io?.emit("message", { type: 'load', url: msg.url });
             // New: Trigger initial buffer check UI for admin
             this.checkBufferStatus();
@@ -511,7 +547,10 @@ export class WebSocketService {
         }
 
         if (msg.type === 'buffer-status') {
+            const previousState = sender.isBuffered;
             sender.isBuffered = !!msg.buffered;
+            logger.info(`[BufferStatus] ${sender.nick}: ${previousState ? 'READY' : 'PENDING'} → ${sender.isBuffered ? 'READY' : 'PENDING'}`);
+            logger.info(`[BufferStatus] Triggering checkBufferStatus (serverState.paused=${serverState.currentVideoState.paused})`);
             this.checkBufferStatus();
             return;
         }
@@ -652,7 +691,7 @@ export class WebSocketService {
                     serverState.currentVideoState = {
                         url: nextVideo.url,
                         time: 0,
-                        paused: false,
+                        paused: true,  // Start paused for buffer sync, auto-play will trigger when all ready
                         timestamp: Date.now()
                     };
                     persistState();
@@ -663,7 +702,7 @@ export class WebSocketService {
                         url: nextVideo.url
                     });
                     this.broadcastQueueState();
-                    logger.info(`[Queue] Auto-playing next: ${nextVideo.title}`);
+                    logger.info(`[Queue] Auto-playing next: ${nextVideo.title} (paused=true for buffer sync)`);
                 } else {
                     // Queue is now empty
                     serverState.currentQueueIndex = -1;
@@ -750,9 +789,12 @@ export class WebSocketService {
     }
 
     private checkBufferStatus() {
-        // Only relevant if we are in a 'loading' state (paused at start)
-        if (!serverState.currentVideoState.paused || serverState.currentVideoState.time > 0.1) {
-            // logger.info(`[BufferCheck] Skipped. Paused: ${serverState.currentVideoState.paused}, Time: ${serverState.currentVideoState.time}`);
+        logger.info(`[BufferCheck] Called - paused=${serverState.currentVideoState.paused}, time=${serverState.currentVideoState.time}`);
+
+        // Only relevant if we are in a paused/loading state
+        // Don't check time position - videos can load at any timestamp (queue resume)
+        if (!serverState.currentVideoState.paused) {
+            logger.info(`[BufferCheck] Skipped - video already playing`);
             return;
         }
 
@@ -796,10 +838,10 @@ export class WebSocketService {
 
         // --- AUTO PLAY LOGIC (Decoupled) ---
         if (allReady && totalCount > 0) {
+            logger.info(`[AutoPlay] All users ready (${readyCount}/${totalCount}). Checking if paused...`);
             // Double check we are actually paused before triggering play
             if (serverState.currentVideoState.paused) {
-                logger.info(`[AutoPlay] All users ready. Starting playback!`);
-
+                logger.info(`[AutoPlay] Video is paused. Starting playback!`);
                 serverState.currentVideoState.paused = false;
                 serverState.currentVideoState.timestamp = Date.now();
                 persistState();
@@ -811,7 +853,11 @@ export class WebSocketService {
                     time: serverState.currentVideoState.time,
                     paused: false
                 });
+            } else {
+                logger.info(`[AutoPlay] Skipped - video already playing (paused=${serverState.currentVideoState.paused})`);
             }
+        } else {
+            logger.info(`[AutoPlay] Not ready yet - allReady=${allReady}, totalCount=${totalCount}`);
         }
     }
 }
