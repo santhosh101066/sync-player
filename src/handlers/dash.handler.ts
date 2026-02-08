@@ -53,7 +53,14 @@ export const dashManifestHandler = async (request: Request, h: ResponseToolkit) 
             if (formatList.length === 0) return "";
             let sets = `    <AdaptationSet mimeType="${mimeType}" subsegmentAlignment="true" startWithSAP="1">\n`;
 
-            for (const f of formatList) {
+            // Limit to top 5 formats to avoid timeout
+            const limitedFormats = formatList.slice(0, 5);
+            let successCount = 0;
+
+            for (const f of limitedFormats) {
+                // Skip if we already have enough successful formats
+                if (successCount >= 3) break;
+
                 let indexRange = f.index_range;
                 let initRange = f.init_range;
                 const itag = f.format_id;
@@ -62,7 +69,7 @@ export const dashManifestHandler = async (request: Request, h: ResponseToolkit) 
 
                 // ...
 
-                // If ranges missing, try to fetch/parse
+                // If ranges missing, try to fetch/parse with timeout
                 if (!indexRange || !initRange) {
                     const cacheKey = `${id}-${itag}`;
                     if (rangesCache[cacheKey]) {
@@ -73,22 +80,32 @@ export const dashManifestHandler = async (request: Request, h: ResponseToolkit) 
                             // Only fetch if we haven't already
                             console.log(`[DASH] Parsing ranges for itag ${itag}...`);
                             const cookies = getCookiesHeader() || undefined;
-                            const ranges = await getMp4Ranges(f.url, cookies);
+
+                            // Use Promise.race to timeout after 3 seconds
+                            const ranges = await Promise.race([
+                                getMp4Ranges(f.url, cookies),
+                                new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000))
+                            ]);
+
                             if (ranges) {
                                 rangesCache[cacheKey] = ranges;
                                 indexRange = ranges.index;
                                 initRange = ranges.init;
                                 console.log(`[DASH] Ranges found for itag ${itag}: Init ${initRange.start}-${initRange.end}, Index ${indexRange.start}-${indexRange.end}`);
                             } else {
-                                console.warn(`[DASH] Parser failed to find atoms for itag ${itag}`);
+                                console.warn(`[DASH] Parser timeout or failed for itag ${itag}`);
+                                continue; // Skip this format
                             }
                         } catch (e) {
                             console.warn(`[DASH] Failed to parse ranges for itag ${itag}:`, e);
+                            continue; // Skip this format
                         }
                     }
                 }
 
                 if (!indexRange || !initRange) continue;
+
+                successCount++;
 
                 const width = f.width || 0;
                 const height = f.height || 0;

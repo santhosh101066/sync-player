@@ -15,7 +15,7 @@ const CACHE_TTL = 3600 * 1000; // 1 hour
 const infoCache: Record<string, { data: any, timestamp: number }> = {};
 
 // Use a fixed User-Agent to match Axios and avoid client mismatch issues
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36';
 
 export const getYtDlpInfo = async (url: string) => {
     try {
@@ -36,6 +36,8 @@ export const getYtDlpInfo = async (url: string) => {
             '--no-warnings',
             '--no-call-home',
             '--prefer-free-formats',
+            '--force-ipv4', // Most important for speed on Mac
+            '--flat-playlist',
             '--no-check-certificate', // Sometimes needed for older environments/proxies
             // CRITICAL: Force User-Agent to match what we use in Axios
             // Remove 'player_client' to allow all formats (1080p), but use UA to pass bot check
@@ -48,6 +50,7 @@ export const getYtDlpInfo = async (url: string) => {
 
         const { stdout } = await execFileAsync(YTDLP_PATH, args, {
             maxBuffer: 1024 * 1024 * 20, // 20MB buffer
+            // timeout: 60000, // 60 second timeout for fetching video info
             env: { ...process.env, LC_ALL: 'en_US.UTF-8' }
         });
 
@@ -59,8 +62,15 @@ export const getYtDlpInfo = async (url: string) => {
         return json;
     } catch (error: any) {
         console.error("[yt-dlp] Info fetch error:", error.message);
-        if (error.stderr) console.error("[yt-dlp] Stderr:", error.stderr);
-        throw error;
+        if (error.stderr) {
+            console.error("[yt-dlp] Stderr:", error.stderr);
+        }
+        if (error.stdout) {
+            console.error("[yt-dlp] Stdout:", error.stdout);
+        }
+        // Return more detailed error for debugging
+        const detailedError = new Error(`yt-dlp failed: ${error.message}${error.stderr ? '\n' + error.stderr : ''}`);
+        throw detailedError;
     }
 };
 

@@ -156,11 +156,20 @@ import yts from "yt-search";
 
 export const searchHandler = async (request: Request, h: ResponseToolkit) => {
     const q = request.query.q as string;
+    const page = parseInt(request.query.page as string) || 1;
     if (!q) return h.response({ error: "No query provided" }).code(400);
 
     try {
+        // yts doesn't support pagination directly, so we fetch more results
+        // and slice based on page number
         const result = await yts(q);
-        const videos = result.videos.slice(0, 20).map((v) => ({
+        const allVideos = result.videos;
+
+        const itemsPerPage = 20;
+        const startIndex = (page - 1) * itemsPerPage;
+        const endIndex = startIndex + itemsPerPage;
+
+        const videos = allVideos.slice(startIndex, endIndex).map((v) => ({
             id: v.videoId,
             title: v.title,
             thumbnail: v.thumbnail,
@@ -169,7 +178,11 @@ export const searchHandler = async (request: Request, h: ResponseToolkit) => {
             views: v.views,
         }));
 
-        return h.response({ videos }).code(200);
+        return h.response({
+            videos,
+            hasMore: endIndex < allVideos.length,
+            totalResults: allVideos.length
+        }).code(200);
     } catch (error: any) {
         console.error("[YouTube] Search error:", error.message);
         return h.response({ error: "Search failed" }).code(500);

@@ -8,10 +8,24 @@ export interface VideoState {
     timestamp: number;
 }
 
+export interface QueueItem {
+    id: string;           // Unique ID for the queue item
+    videoId: string;      // YouTube video ID
+    url: string;          // Full YouTube URL
+    title: string;        // Video title
+    thumbnail: string;    // Thumbnail URL
+    author: string;       // Channel name
+    duration: string;     // Duration string (e.g., "3:45")
+    addedBy: string;      // User ID who added it
+    addedAt: number;      // Timestamp
+}
+
 interface ServerState {
     areUserControlsAllowed: boolean;
     isProxyEnabled: boolean;
     currentVideoState: VideoState;
+    videoQueue: QueueItem[];        // Queue array
+    currentQueueIndex: number;      // Index of currently playing video (-1 if not from queue)
 }
 
 const STATE_FILE = path.join(process.cwd(), 'server-state.json');
@@ -25,7 +39,9 @@ const defaultState: ServerState = {
         time: 0,
         paused: true,
         timestamp: Date.now()
-    }
+    },
+    videoQueue: [],
+    currentQueueIndex: -1
 };
 
 // 2. Load State from Disk (Synchronous on startup)

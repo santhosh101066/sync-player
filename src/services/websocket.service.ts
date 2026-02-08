@@ -147,6 +147,9 @@ export class WebSocketService {
                 });
             }
 
+            // Send queue state to new client
+            this.sendQueueStateTo(socket);
+
             socket.on("voice", (data: any) => {
                 const sender = this.clients.get(socket.id);
                 if (!sender || sender.isMuted) return;
@@ -483,6 +486,157 @@ export class WebSocketService {
             return;
         }
 
+        // --- QUEUE MANAGEMENT HANDLERS ---
+
+        if (msg.type === 'queue-add') {
+            // All users can add to queue
+            const queueItem = {
+                id: `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                videoId: msg.video.videoId,
+                url: msg.video.url,
+                title: msg.video.title,
+                thumbnail: msg.video.thumbnail,
+                author: msg.video.author,
+                duration: msg.video.duration,
+                addedBy: sender.userId,
+                addedAt: Date.now()
+            };
+            serverState.videoQueue.push(queueItem);
+            persistState();
+            this.broadcastQueueState();
+            logger.info(`[Queue] ${sender.nick} added: ${queueItem.title}`);
+            return;
+        }
+
+        if (msg.type === 'queue-play-next' && sender.isAdmin) {
+            // Insert at front of queue
+            const queueItem = {
+                id: `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                videoId: msg.video.videoId,
+                url: msg.video.url,
+                title: msg.video.title,
+                thumbnail: msg.video.thumbnail,
+                author: msg.video.author,
+                duration: msg.video.duration,
+                addedBy: sender.userId,
+                addedAt: Date.now()
+            };
+            serverState.videoQueue.unshift(queueItem);
+            // Adjust current index if we're playing from queue
+            if (serverState.currentQueueIndex >= 0) {
+                serverState.currentQueueIndex++;
+            }
+            persistState();
+            this.broadcastQueueState();
+            logger.info(`[Queue] ${sender.nick} added to front: ${queueItem.title}`);
+            return;
+        }
+
+        if (msg.type === 'queue-play-now' && sender.isAdmin) {
+            // Play immediately, not from queue
+            serverState.currentQueueIndex = -1;
+            serverState.currentVideoState = {
+                url: msg.video.url,
+                time: 0,
+                paused: false,
+                timestamp: Date.now()
+            };
+            persistState();
+            this.io?.emit("message", {
+                type: 'load',
+                url: msg.video.url
+            });
+            logger.info(`[Queue] ${sender.nick} playing now: ${msg.video.title}`);
+            return;
+        }
+
+        if (msg.type === 'queue-remove' && sender.isAdmin) {
+            const itemIndex = serverState.videoQueue.findIndex(item => item.id === msg.itemId);
+            if (itemIndex !== -1) {
+                const removed = serverState.videoQueue.splice(itemIndex, 1)[0];
+
+                // Adjust current index if needed
+                if (serverState.currentQueueIndex > itemIndex) {
+                    serverState.currentQueueIndex--;
+                } else if (serverState.currentQueueIndex === itemIndex) {
+                    // Removed the currently playing video - keep playing but mark as not from queue
+                    serverState.currentQueueIndex = -1;
+                }
+
+                persistState();
+                this.broadcastQueueState();
+                logger.info(`[Queue] ${sender.nick} removed: ${removed.title}`);
+            }
+            return;
+        }
+
+        if (msg.type === 'queue-reorder' && sender.isAdmin) {
+            const { fromIndex, toIndex } = msg;
+            if (fromIndex >= 0 && fromIndex < serverState.videoQueue.length &&
+                toIndex >= 0 && toIndex < serverState.videoQueue.length) {
+
+                const [item] = serverState.videoQueue.splice(fromIndex, 1);
+                serverState.videoQueue.splice(toIndex, 0, item);
+
+                // Adjust current index if needed
+                if (serverState.currentQueueIndex === fromIndex) {
+                    serverState.currentQueueIndex = toIndex;
+                } else if (fromIndex < serverState.currentQueueIndex && toIndex >= serverState.currentQueueIndex) {
+                    serverState.currentQueueIndex--;
+                } else if (fromIndex > serverState.currentQueueIndex && toIndex <= serverState.currentQueueIndex) {
+                    serverState.currentQueueIndex++;
+                }
+
+                persistState();
+                this.broadcastQueueState();
+                logger.info(`[Queue] ${sender.nick} reordered: ${fromIndex} -> ${toIndex}`);
+            }
+            return;
+        }
+
+        if (msg.type === 'queue-get') {
+            this.sendQueueStateTo(socket);
+            return;
+        }
+
+        if (msg.type === 'video-ended') {
+            // Auto-advance logic with auto-removal
+            if (serverState.currentQueueIndex >= 0 && serverState.videoQueue.length > 0) {
+                // Remove the video that just finished playing
+                const playedVideo = serverState.videoQueue[serverState.currentQueueIndex];
+                serverState.videoQueue.splice(serverState.currentQueueIndex, 1);
+                logger.info(`[Queue] Removed played video: ${playedVideo?.title}`);
+
+                // Check if there are more videos in the queue
+                if (serverState.videoQueue.length > 0 && serverState.currentQueueIndex < serverState.videoQueue.length) {
+                    // Play the next video (which is now at the same index after removal)
+                    const nextVideo = serverState.videoQueue[serverState.currentQueueIndex];
+
+                    serverState.currentVideoState = {
+                        url: nextVideo.url,
+                        time: 0,
+                        paused: false,
+                        timestamp: Date.now()
+                    };
+                    persistState();
+
+                    this.io?.emit("message", {
+                        type: 'load',
+                        url: nextVideo.url
+                    });
+                    this.broadcastQueueState();
+                    logger.info(`[Queue] Auto-advance to: ${nextVideo.title}`);
+                } else {
+                    // End of queue - reset index
+                    serverState.currentQueueIndex = -1;
+                    persistState();
+                    this.broadcastQueueState();
+                    logger.info(`[Queue] End of queue reached, all videos played`);
+                }
+            }
+            return;
+        }
+
         if (msg.type === 'ping') {
             socket.emit("message", { type: 'pong', startTime: msg.startTime });
             return;
@@ -537,5 +691,21 @@ export class WebSocketService {
         if (this.chatHistory.length > this.MAX_HISTORY) this.chatHistory.shift();
 
         this.io?.emit("message", msg);
+    }
+
+    private broadcastQueueState() {
+        this.io?.emit("message", {
+            type: 'queue-state',
+            queue: serverState.videoQueue,
+            currentIndex: serverState.currentQueueIndex
+        });
+    }
+
+    private sendQueueStateTo(socket: Socket) {
+        socket.emit("message", {
+            type: 'queue-state',
+            queue: serverState.videoQueue,
+            currentIndex: serverState.currentQueueIndex
+        });
     }
 }

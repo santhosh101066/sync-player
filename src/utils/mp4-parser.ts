@@ -19,7 +19,8 @@ export const getMp4Ranges = async (url: string, cookies?: string, userAgent?: st
         // Fetch first 32KB to find atoms
         const response = await axios.get(url, {
             headers: headers,
-            responseType: 'arraybuffer'
+            responseType: 'arraybuffer',
+            timeout: 5000 // 5 second timeout to prevent hanging
         });
 
         const buffer = Buffer.from(response.data);
