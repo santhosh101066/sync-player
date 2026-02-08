@@ -600,17 +600,18 @@ export class WebSocketService {
         }
 
         if (msg.type === 'video-ended') {
-            // Auto-advance logic with auto-removal
-            if (serverState.currentQueueIndex >= 0 && serverState.videoQueue.length > 0) {
-                // Remove the video that just finished playing
-                const playedVideo = serverState.videoQueue[serverState.currentQueueIndex];
-                serverState.videoQueue.splice(serverState.currentQueueIndex, 1);
-                logger.info(`[Queue] Removed played video: ${playedVideo?.title}`);
+            // Auto-advance logic: FIFO Queue
+            // The currently playing video is always at index 0 (or we just treat the queue as a list to consume)
 
-                // Check if there are more videos in the queue
-                if (serverState.videoQueue.length > 0 && serverState.currentQueueIndex < serverState.videoQueue.length) {
-                    // Play the next video (which is now at the same index after removal)
-                    const nextVideo = serverState.videoQueue[serverState.currentQueueIndex];
+            if (serverState.videoQueue.length > 0) {
+                // 1. Remove the video that just finished (the head of the queue)
+                const finishedVideo = serverState.videoQueue.shift();
+                logger.info(`[Queue] Finished & Removed: ${finishedVideo?.title}`);
+
+                // 2. Check if there are more videos
+                if (serverState.videoQueue.length > 0) {
+                    const nextVideo = serverState.videoQueue[0];
+                    serverState.currentQueueIndex = 0; // Always playing the head
 
                     serverState.currentVideoState = {
                         url: nextVideo.url,
@@ -620,18 +621,19 @@ export class WebSocketService {
                     };
                     persistState();
 
+                    // 3. Notify clients to load & play
                     this.io?.emit("message", {
                         type: 'load',
                         url: nextVideo.url
                     });
                     this.broadcastQueueState();
-                    logger.info(`[Queue] Auto-advance to: ${nextVideo.title}`);
+                    logger.info(`[Queue] Auto-playing next: ${nextVideo.title}`);
                 } else {
-                    // End of queue - reset index
+                    // Queue is now empty
                     serverState.currentQueueIndex = -1;
                     persistState();
                     this.broadcastQueueState();
-                    logger.info(`[Queue] End of queue reached, all videos played`);
+                    logger.info(`[Queue] Queue finished. All videos played.`);
                 }
             }
             return;

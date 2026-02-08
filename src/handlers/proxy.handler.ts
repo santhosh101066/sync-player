@@ -6,12 +6,12 @@ import { serverState } from "../services/state.service";
 import https from "https";
 
 // Re-use agent to keep connections alive for sequential segment fetches
-const agent = new https.Agent({
-    keepAlive: true,
-    maxSockets: 100,
-    maxFreeSockets: 10,
-    timeout: 60000
-});
+// const agent = new https.Agent({
+//     keepAlive: true,
+//     maxSockets: 100,
+//     maxFreeSockets: 10,
+//     timeout: 60000
+// });
 
 // --- HELPER: Security Check ---
 const validateRequest = (request: Request) => {
@@ -41,18 +41,29 @@ export const proxyStreamHandler = async (request: Request, h: ResponseToolkit) =
     const check = validateRequest(request);
     if (!check.valid) return h.response({ error: check.error }).code(check.code!);
 
-    const { url, ref } = request.query;
+    const { url, ref, headers: headersParam } = request.query;
     if (!url) return h.response({ error: 'No URL' }).code(400);
 
     try {
         const decodedUrl = Buffer.from(url, 'base64').toString('utf-8');
         const referer = ref ? Buffer.from(ref, 'base64').toString('utf-8') : undefined;
 
+        let customHeaders: Record<string, string> = {};
+        if (headersParam) {
+            try {
+                const jsonHeaders = Buffer.from(headersParam, 'base64').toString('utf-8');
+                customHeaders = JSON.parse(jsonHeaders);
+            } catch (e) {
+                console.warn("Failed to parse custom headers param");
+            }
+        }
+
         const requestHeaders: Record<string, string | undefined> = {
             'Referer': referer,
             'User-Agent': request.headers['user-agent'],
             'Accept': request.headers['accept'],
             'Accept-Encoding': request.headers['accept-encoding'],
+            ...customHeaders
         };
         if (request.headers.range) requestHeaders['Range'] = request.headers.range;
 
@@ -61,7 +72,7 @@ export const proxyStreamHandler = async (request: Request, h: ResponseToolkit) =
             headers: requestHeaders,
             validateStatus: () => true,
             decompress: false,
-            httpsAgent: agent, // Use keep-alive agent
+            // httpsAgent: agent, // Use keep-alive agent
             timeout: 30000 // 30s timeout per segment
         });
         const stream = response.data as IncomingMessage;
@@ -107,7 +118,7 @@ export const proxyPlaylistHandler = async (request: Request, h: ResponseToolkit)
             responseType: "text",
             headers,
             validateStatus: () => true,
-            httpsAgent: agent,
+            // httpsAgent: agent,
             timeout: 10000 // 10s for playlist
         });
         if (resp.status < 200 || resp.status >= 300) return h.response({ error: "Fetch failed" }).code(resp.status);

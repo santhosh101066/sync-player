@@ -5,23 +5,33 @@ export interface Mp4Ranges {
     index: { start: number; end: number };
 }
 
-export const getMp4Ranges = async (url: string, cookies?: string, userAgent?: string): Promise<Mp4Ranges | null> => {
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36';
+
+export const getMp4Ranges = async (url: string, customHeaders?: Record<string, string>): Promise<Mp4Ranges | null> => {
     try {
         const headers: any = {
-            'Range': 'bytes=0-32767',
-            'User-Agent': userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'Range': 'bytes=0-65535',
+            'User-Agent': UA,
+            'Accept': '*/*',
+            'Connection': 'keep-alive',
+            ...customHeaders
         };
 
-        if (cookies) {
-            headers['Cookie'] = cookies;
-        }
+        console.log(`[Mp4Parser] Requesting ${url.substring(0, 50)}... with headers:`, JSON.stringify(headers));
 
-        // Fetch first 32KB to find atoms
+        // Fetch first 64KB to find atoms
         const response = await axios.get(url, {
             headers: headers,
             responseType: 'arraybuffer',
-            timeout: 5000 // 5 second timeout to prevent hanging
+            timeout: 10000,
+            validateStatus: () => true // handled below
         });
+
+        if (response.status >= 400) {
+            console.error(`[Mp4Parser] Failed with status ${response.status}: ${response.statusText}`);
+            // console.error(`[Mp4Parser] Response body:`, response.data.toString('utf8').substring(0, 200));
+            return null;
+        }
 
         const buffer = Buffer.from(response.data);
         let offset = 0;
@@ -93,8 +103,8 @@ export const getMp4Ranges = async (url: string, cookies?: string, userAgent?: st
 
         return null;
 
-    } catch (e) {
-        console.error("[Mp4Parser] Error:", e);
+    } catch (e: any) {
+        console.error("[Mp4Parser] Error:", e.response?.data?.toString('utf8'));
         return null;
     }
 }

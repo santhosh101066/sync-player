@@ -5,6 +5,7 @@ import axios from "axios";
 
 // --- RESOLVE STREAM HANDLER ---
 // Used to just get metadata/url without streaming
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36';
 export const resolveHandler = async (request: Request, h: ResponseToolkit) => {
     const url = request.query.url as string;
     const id = request.query.id as string;
@@ -17,8 +18,9 @@ export const resolveHandler = async (request: Request, h: ResponseToolkit) => {
 
         // Find best format (Video + Audio preferred for direct play)
         // yt-dlp separates them often for high quality, but for simple resolve we want a combo file if possible
-        let format = info.formats.find((f: any) => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4');
-
+        let formats = info.formats.filter((f: any) => f.vcodec !== 'none');
+        formats.sort((a: any, b: any) => (b.height || 0) - (a.height || 0));
+        let format = formats[0];
         // Fallback to best video + audio match manually? 
         // For now just return the best combo or first available
         if (!format) {
@@ -34,7 +36,8 @@ export const resolveHandler = async (request: Request, h: ResponseToolkit) => {
             url: format.url,
             title: info.title,
             author: info.uploader,
-            duration: info.duration
+            duration: info.duration,
+            quality: format.height
         }).code(200);
 
     } catch (error: any) {
@@ -45,106 +48,81 @@ export const resolveHandler = async (request: Request, h: ResponseToolkit) => {
 
 // --- STREAM HANDLER ---
 // Proxies the video stream through our server
+// --- STREAM HANDLER ---
+// Proxies the video stream through our server
+// Uses cached info to resolve the URL and proxies it with correct headers
 export const streamHandler = async (request: Request, h: ResponseToolkit) => {
     const id = request.query.id as string;
-    if (!id) return h.response({ error: "No ID provided" }).code(400);
+    const itag = request.query.itag as string;
+    // const start = request.query.start as string; 
 
-    const videoUrl = `https://www.youtube.com/watch?v=${id}`;
+    if (!id || !itag) return h.response({ error: "Missing params" }).code(400);
 
     try {
-        const info = await getYtDlpInfo(videoUrl) as any;
-        const itag = request.query.itag as string;
-        let format: any;
+        // 1. Get Info (Should hit cache if recent)
+        const info = await getYtDlpInfo(`https://www.youtube.com/watch?v=${id}`) as any;
 
-        if (itag) {
-            // Precise selection for DASH/HLS
-            format = info.formats.find((f: any) => f.format_id === itag);
-            if (!format) {
-                return h.response({ error: `Format ${itag} not found` }).code(404);
-            }
-        } else {
-            // Auto-selection (Legacy/Default)
-            // Try to find mp4 with audio+video
-            const formats = info.formats.filter((f: any) => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4');
-            // Sort by height desc
-            formats.sort((a: any, b: any) => (b.height || 0) - (a.height || 0));
-            format = formats[0];
-
-            // Fallback
-            if (!format) {
-                format = info.formats.filter((f: any) => f.ext === 'mp4')[0];
-            }
-        }
-
+        // 2. Find Format
+        const format = info.formats.find((f: any) => f.format_id === itag);
         if (!format || !format.url) {
-            return h.response({ error: "No suitable stream found" }).code(404);
+            console.error(`[Stream] Format ${itag} not found for video ${id}`);
+            return h.response({ error: "Format not found" }).code(404);
         }
 
-        // Log selected format
-        if (!itag) console.log(`[YouTube] Selected format: ${format.format} (${format.ext})`);
+        // 3. Prepare Proxy Headers
+        const cookies = getCookiesHeader('youtube.com');
+        const proxyHeaders: Record<string, string | undefined> = {
+            'User-Agent': UA,
+            'Range': request.headers.range, // Forward client range
+            'Accept': request.headers.accept || '*/*',
+            'Accept-Encoding': 'identity', // Prevent double compression issues
+            'Connection': 'keep-alive',
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com'
+        };
 
-        // Proxy the stream using Axios
-        // The URL is signed BUT we need to pass headers to mimic a browser to avoid 403/Bot check
-        try {
-            const cookieHeader = getCookiesHeader();
-            const headers: any = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': '*/*',
-                'Connection': 'keep-alive',
-                'Referer': 'https://www.youtube.com/',
-                'Origin': 'https://www.youtube.com'
-            };
-
-            if (cookieHeader) {
-                headers['Cookie'] = cookieHeader;
-            }
-
-            // Forward Range header if present
-            if (request.headers.range) {
-                headers['Range'] = request.headers.range;
-            }
-
-            const response = await axios({
-                method: 'GET',
-                url: format.url,
-                headers: headers,
-                responseType: 'stream',
-                validateStatus: (status) => status >= 200 && status < 400, // Accept 206
-                maxContentLength: 524288000, // 500MB
-                maxBodyLength: 524288000,    // 500MB
-                timeout: 0,                   // No timeout for streams
-                maxRedirects: 5,
-                decompress: false             // Don't decompress, pipe as-is
-            });
-
-            const res = h.response(response.data)
-                .type(format.vcodec !== 'none' ? `video/${format.ext}` : `audio/${format.ext}`)
-                .header('Accept-Ranges', 'bytes');
-
-            if (response.headers['content-length']) {
-                res.header('Content-Length', response.headers['content-length']);
-            }
-            if (response.headers['content-range']) {
-                res.header('Content-Range', response.headers['content-range']);
-                res.code(206);
-            }
-            if (response.headers['content-disposition']) {
-                res.header('Content-Disposition', response.headers['content-disposition']);
-            }
-
-            return res;
-
-        } catch (error: any) {
-            if (error.response) {
-                console.error(`[Stream Proxy] Error ${error.response.status} from YouTube`);
-            } else {
-                console.error("[Stream Proxy] Request Error:", error.message);
-            }
-            throw new Error(`Stream error: ${error.message}`);
+        if (cookies) {
+            proxyHeaders['Cookie'] = cookies.replace(/[\r\n]/g, '');
         }
+
+        // Add extra headers from yt-dlp if available
+        const ytHeaders = format.http_headers || info.http_headers;
+        if (ytHeaders) {
+            Object.assign(proxyHeaders, ytHeaders);
+        }
+
+        // Debug Log
+        console.log(`[Stream] Proxying ${itag} for ${id}`);
+        // console.log(`[Stream] Upstream URL: ${format.url}`);
+        // console.log(`[Stream] Upstream Headers:`, JSON.stringify(proxyHeaders));
+
+        // 4. Proxy Request
+        const response = await axios({
+            method: 'GET',
+            url: format.url,
+            headers: proxyHeaders,
+            responseType: 'stream',
+            validateStatus: () => true, // Handle 4xx manually
+            decompress: false
+        });
+
+        if (response.status >= 400) {
+            console.error(`[Stream] Upstream error ${response.status} for ${itag}: ${response.statusText}`);
+            return h.response({ error: "Upstream error" }).code(502);
+        }
+
+        const res = h.response(response.data);
+
+        // Forward essential headers
+        if (response.headers['content-range']) res.header('Content-Range', response.headers['content-range']);
+        if (response.headers['content-length']) res.header('Content-Length', response.headers['content-length']);
+        if (response.headers['content-type']) res.header('Content-Type', response.headers['content-type']);
+        if (response.headers['accept-ranges']) res.header('Accept-Ranges', response.headers['accept-ranges']);
+
+        return res.code(response.status);
 
     } catch (error: any) {
-        console.error("[YouTube] Stream error:", error.message);
+        console.error(`[Stream] Proxy failed: ${error.message}`);
         return h.response({ error: "Streaming failed" }).code(500);
     }
 };

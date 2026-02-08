@@ -3,7 +3,7 @@ import path from "path";
 
 const COOKIES_PATH = path.join(__dirname, "../../cookies.txt");
 
-export const getCookiesHeader = (): string | null => {
+export const getCookiesHeader = (targetDomain?: string): string | null => {
     const cookiesPath = path.join(__dirname, "../../cookies.txt");
     if (!fs.existsSync(cookiesPath)) {
         return null;
@@ -16,13 +16,27 @@ export const getCookiesHeader = (): string | null => {
         const cookies = lines.map(line => {
             const parts = line.split("\t");
             if (parts.length >= 7) {
+                const domain = parts[0];
                 const name = parts[5];
                 const value = parts[6];
+
+                // Filter by domain if provided
+                if (targetDomain) {
+                    if (domain === targetDomain || domain.endsWith(`.${targetDomain}`) || targetDomain.endsWith(domain)) {
+                        return `${name}=${value}`;
+                    }
+                    return null;
+                }
+
+                // If no targetDomain, return all (Warning: can be huge)
                 return `${name}=${value}`;
             }
             return null;
         }).filter(c => c !== null);
 
+        // Deduplicate cookies (take last one found, similar to browser behavior)
+        // Actually, just joining them is usually enough, but let's be cleaner if possible.
+        // For now, straight join to minimize risk of breaking specific auth flows.
         return cookies.join("; ");
     } catch (e) {
         console.error("[Cookies] Failed to read cookies:", e);

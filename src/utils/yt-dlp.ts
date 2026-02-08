@@ -19,69 +19,51 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 
 export const getYtDlpInfo = async (url: string) => {
     try {
-        // Check Cache
         if (infoCache[url]) {
             const entry = infoCache[url];
-            if (Date.now() - entry.timestamp < CACHE_TTL) {
-                // console.log("[yt-dlp] Returning cached info");
-                return entry.data;
-            }
+            if (Date.now() - entry.timestamp < CACHE_TTL) return entry.data;
             delete infoCache[url];
         }
 
-        // Direct spawn of binary to bypass node wrapper trying to use python
         const args = [
             url,
             '--dump-single-json',
             '--no-warnings',
             '--no-call-home',
-            '--prefer-free-formats',
-            '--force-ipv4', // Most important for speed on Mac
             '--flat-playlist',
-            '--no-check-certificate', // Sometimes needed for older environments/proxies
-            // CRITICAL: Force User-Agent to match what we use in Axios
-            // Remove 'player_client' to allow all formats (1080p), but use UA to pass bot check
+            '--no-check-certificate',
+            '--remote-components', 'ejs:github',
+            // '--extractor-args', 'youtube:player_client=ios,android;player_skip=configs,js', // Restricted clients might be hiding adaptive formats
             '--user-agent', UA
         ];
 
-        if (fs.existsSync(COOKIES_PATH)) {
-            args.push('--cookies', COOKIES_PATH);
-        }
+        if (fs.existsSync(COOKIES_PATH)) args.push('--cookies', COOKIES_PATH);
 
+        console.log(`[yt-dlp] Fetching info for: ${url}`);
         const { stdout } = await execFileAsync(YTDLP_PATH, args, {
-            maxBuffer: 1024 * 1024 * 20, // 20MB buffer
-            // timeout: 60000, // 60 second timeout for fetching video info
+            maxBuffer: 1024 * 1024 * 50,
             env: { ...process.env, LC_ALL: 'en_US.UTF-8' }
         });
 
         const json = JSON.parse(stdout);
+        console.log(`[yt-dlp] Info fetched. Title: ${json.title}, Formats: ${json.formats?.length}`);
 
-        // Cache success
         infoCache[url] = { data: json, timestamp: Date.now() };
-
         return json;
     } catch (error: any) {
-        console.error("[yt-dlp] Info fetch error:", error.message);
-        if (error.stderr) {
-            console.error("[yt-dlp] Stderr:", error.stderr);
-        }
-        if (error.stdout) {
-            console.error("[yt-dlp] Stdout:", error.stdout);
-        }
-        // Return more detailed error for debugging
-        const detailedError = new Error(`yt-dlp failed: ${error.message}${error.stderr ? '\n' + error.stderr : ''}`);
-        throw detailedError;
+        console.error(`[yt-dlp] Error fetching info: ${error.message}`);
+        throw new Error(`yt-dlp failed: ${error.message}`);
     }
 };
-
 // Helper to spawn a process for piping the stream (Legacy/Direct Pipe)
-export const getStreamArgs = (url: string, formatId?: string, range?: string) => {
+export const getStreamArgs = (url: string, formatId?: string) => {
     const args = [
         url,
         '--output', '-', // Pipe to stdout
         '--no-part',     // Don't use .part files
         '--no-cache-dir',
-        '--no-buffer'
+        '--no-buffer',
+        '--ignore-errors', // Keep processing if something minor fails
     ];
 
     if (fs.existsSync(COOKIES_PATH)) {
@@ -91,8 +73,46 @@ export const getStreamArgs = (url: string, formatId?: string, range?: string) =>
     if (formatId) {
         args.push('-f', formatId);
     } else {
-        // Fallback default
-        args.push('-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / hv*[ext=mp4]+wa[ext=m4a]');
+        // Ultimate Quality Priority & Robust Fallback
+        // 1. Sort by resolution, fps, av1, vp9, bitrate
+        args.push('-S', 'res,fps,codec:av1,codec:vp9,bitrate');
+
+        // 2. The "Perfect" Format String
+        // - Primary: Best Video (mp4) + Best Audio (m4a/opus)
+        // - Secondary: Best Video (any) + Best Audio (any) -> will be merged by ffmpeg if needed, but for piping we might need to be careful. 
+        // Note: Piping merged formats requires ffmpeg on the system (which we have).
+        args.push('-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b');
+    }
+
+    return args;
+};
+
+// Helper for file downloads (saving to disk)
+export const getDownloadArgs = (url: string, outputDir: string) => {
+    const args = [
+        url,
+        // Professional Naming Convention
+        '-o', `${outputDir}/%(title)s [%(height)s] [%(id)s].%(ext)s`,
+
+        // Container Enforcement
+        '--merge-output-format', 'mp4',
+
+        // Quality & Fallback
+        '-S', 'res,fps,codec:av1,codec:vp9,bitrate',
+        '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b',
+
+        '--ignore-errors',
+        '--no-check-certificate', // Only if necessary, but good for stability
+        '--no-warnings',
+
+        // Add metadata
+        '--add-metadata',
+        '--embed-thumbnail',
+        '--embed-chapters'
+    ];
+
+    if (fs.existsSync(COOKIES_PATH)) {
+        args.push('--cookies', COOKIES_PATH);
     }
 
     return args;
