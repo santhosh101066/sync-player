@@ -28,6 +28,7 @@ interface Client {
     picture?: string;
     isAuthenticated: boolean;
     isReady: boolean;
+    isBuffered?: boolean; // Track if client has buffered enough
 }
 
 // Define structure for stored messages
@@ -176,6 +177,7 @@ export class WebSocketService {
                         text: `${leaver.nick} left`,
                         isSystem: true
                     });
+                    this.checkBufferStatus(); // Re-check if we were waiting for this user
                 }
             });
         });
@@ -243,6 +245,7 @@ export class WebSocketService {
 
                     logger.info(`[Auth] Verified: ${sender.nick} (userId: ${hashedUserId.substring(0, 8)}...)`);
                     this.broadcastUserList();
+                    this.checkBufferStatus(); // Re-check buffer status with new user
 
                     // Send welcome/state just like 'identify'
                     socket.emit("message", {
@@ -326,6 +329,7 @@ export class WebSocketService {
 
                 logger.info(`[Auth-Dev] Verified: ${sender.nick} (${devEmail})`);
                 this.broadcastUserList();
+                this.checkBufferStatus(); // Re-check buffer status
 
                 socket.emit("message", {
                     type: 'auth-success',
@@ -469,9 +473,10 @@ export class WebSocketService {
         }
 
         if (msg.type === 'load' && sender.isAdmin) {
-            // Reset everyone's ready state
+            // Reset everyone's ready/buffer state
             for (const client of this.clients.values()) {
                 client.isReady = false;
+                client.isBuffered = false;
             }
             this.broadcastUserList();
 
@@ -483,6 +488,14 @@ export class WebSocketService {
             };
             persistState();
             this.io?.emit("message", { type: 'load', url: msg.url });
+            // New: Trigger initial buffer check UI for admin
+            this.checkBufferStatus();
+            return;
+        }
+
+        if (msg.type === 'buffer-status') {
+            sender.isBuffered = !!msg.buffered;
+            this.checkBufferStatus();
             return;
         }
 
@@ -709,5 +722,61 @@ export class WebSocketService {
             queue: serverState.videoQueue,
             currentIndex: serverState.currentQueueIndex
         });
+    }
+
+    private checkBufferStatus() {
+        // Only relevant if we are in a 'loading' state (paused at start)
+        if (!serverState.currentVideoState.paused || serverState.currentVideoState.time > 0.1) {
+            // logger.info(`[BufferCheck] Skipped. Paused: ${serverState.currentVideoState.paused}, Time: ${serverState.currentVideoState.time}`);
+            return;
+        }
+
+        let allReady = true;
+        let readyCount = 0;
+        let totalCount = 0;
+
+        for (const client of this.clients.values()) {
+            if (client.userId.startsWith('temp_')) continue; // Ignore unauthed
+            totalCount++;
+            if (!client.isBuffered) {
+                allReady = false;
+            } else {
+                readyCount++;
+            }
+        }
+
+        // Broadcast progress to Admin
+        const adminSocket = Array.from(this.clients.values()).find(c => c.isAdmin)?.socket;
+        if (adminSocket) {
+            adminSocket.emit("message", {
+                type: 'buffer-progress',
+                ready: readyCount,
+                total: totalCount,
+                allReady
+            });
+            logger.info(`[BufferCheck] Ready: ${readyCount}/${totalCount} (${allReady ? 'ALL READY' : 'WAITING'})`);
+        } else {
+            logger.info(`[BufferCheck] (No Admin) Ready: ${readyCount}/${totalCount}`);
+        }
+
+        // --- AUTO PLAY LOGIC (Decoupled) ---
+        if (allReady && totalCount > 0) {
+            // Double check we are actually paused before triggering play
+            if (serverState.currentVideoState.paused) {
+                logger.info(`[AutoPlay] All users ready. Starting playback!`);
+
+                serverState.currentVideoState.paused = false;
+                serverState.currentVideoState.timestamp = Date.now();
+                persistState();
+
+                // Broadcast Force Sync to start everyone
+                this.io?.emit("message", {
+                    type: 'forceSync',
+                    url: serverState.currentVideoState.url,
+                    time: serverState.currentVideoState.time,
+                    paused: false
+                });
+            }
+        }
     }
 }
