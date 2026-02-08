@@ -48,28 +48,55 @@ export const resolveHandler = async (request: Request, h: ResponseToolkit) => {
 
 // --- STREAM HANDLER ---
 // Proxies the video stream through our server
+// --- CACHE SETUP ---
+const CACHE_TTL = 3600 * 1000; // 1 hr
+const MAX_CACHE_SIZE = 50; // Keep last 50 segments to avoid OOM (approx 50-100MB)
+// Key: "id-itag-range", Value: { data: Buffer, timestamp: number, headers: any }
+const segmentCache = new Map<string, { data: Buffer, timestamp: number, headers: any }>();
+
 // --- STREAM HANDLER ---
 // Proxies the video stream through our server
 // Uses cached info to resolve the URL and proxies it with correct headers
 export const streamHandler = async (request: Request, h: ResponseToolkit) => {
     const id = request.query.id as string;
     const itag = request.query.itag as string;
-    // const start = request.query.start as string; 
+    const range = request.headers.range;
 
     if (!id || !itag) return h.response({ error: "Missing params" }).code(400);
 
+    // 0. Cache Key Construction
+    // Only cache specific range requests (typical for DASH segments)
+    // Avoid caching full file requests (unless small?)
+    const cacheKey = `${id}-${itag}-${range || 'full'}`;
+
+    // 1. Check Cache
+    if (segmentCache.has(cacheKey)) {
+        const entry = segmentCache.get(cacheKey)!;
+        if (Date.now() - entry.timestamp < CACHE_TTL) {
+            console.log(`[Stream] Cache HIT for ${cacheKey}`);
+            const res = h.response(entry.data);
+            // Replay headers
+            Object.entries(entry.headers).forEach(([k, v]) => {
+                res.header(k, v as string);
+            });
+            return res.code(206); // Assuming cached segments are 206
+        } else {
+            segmentCache.delete(cacheKey);
+        }
+    }
+
     try {
-        // 1. Get Info (Should hit cache if recent)
+        // 2. Get Info (Should hit cache if recent)
         const info = await getYtDlpInfo(`https://www.youtube.com/watch?v=${id}`) as any;
 
-        // 2. Find Format
+        // 3. Find Format
         const format = info.formats.find((f: any) => f.format_id === itag);
         if (!format || !format.url) {
             console.error(`[Stream] Format ${itag} not found for video ${id}`);
             return h.response({ error: "Format not found" }).code(404);
         }
 
-        // 3. Prepare Proxy Headers
+        // 4. Prepare Proxy Headers
         const cookies = getCookiesHeader('youtube.com');
         const proxyHeaders: Record<string, string | undefined> = {
             'User-Agent': UA,
@@ -92,16 +119,19 @@ export const streamHandler = async (request: Request, h: ResponseToolkit) => {
         }
 
         // Debug Log
-        console.log(`[Stream] Proxying ${itag} for ${id}`);
-        // console.log(`[Stream] Upstream URL: ${format.url}`);
-        // console.log(`[Stream] Upstream Headers:`, JSON.stringify(proxyHeaders));
+        console.log(`[Stream] Proxying ${itag} for ${id} (Range: ${range})`);
 
-        // 4. Proxy Request
+        // 5. Proxy Request
+        // Strategy: 
+        // - If Range is present (DASH Segment), fetch as buffer to cache it.
+        // - If No Range (Full Video), fetch as stream to avoid OOM and high latency.
+        const shouldCache = !!range;
+
         const response = await axios({
             method: 'GET',
             url: format.url,
             headers: proxyHeaders,
-            responseType: 'stream',
+            responseType: shouldCache ? 'arraybuffer' : 'stream',
             validateStatus: () => true, // Handle 4xx manually
             decompress: false
         });
@@ -111,15 +141,46 @@ export const streamHandler = async (request: Request, h: ResponseToolkit) => {
             return h.response({ error: "Upstream error" }).code(502);
         }
 
-        const res = h.response(response.data);
+        // 6. Handle Response
+        if (shouldCache) {
+            // Buffer & Cache Logic
+            const data = response.data as Buffer;
 
-        // Forward essential headers
-        if (response.headers['content-range']) res.header('Content-Range', response.headers['content-range']);
-        if (response.headers['content-length']) res.header('Content-Length', response.headers['content-length']);
-        if (response.headers['content-type']) res.header('Content-Type', response.headers['content-type']);
-        if (response.headers['accept-ranges']) res.header('Accept-Ranges', response.headers['accept-ranges']);
+            // Prepare headers to cache
+            const responseHeaders: Record<string, string> = {};
+            if (response.headers['content-range']) responseHeaders['Content-Range'] = response.headers['content-range'];
+            if (response.headers['content-length']) responseHeaders['Content-Length'] = response.headers['content-length'];
+            if (response.headers['content-type']) responseHeaders['Content-Type'] = response.headers['content-type'];
+            if (response.headers['accept-ranges']) responseHeaders['Accept-Ranges'] = response.headers['accept-ranges'];
 
-        return res.code(response.status);
+            // Only cache if valid size
+            if (data.length < 5 * 1024 * 1024) {
+                if (segmentCache.size >= MAX_CACHE_SIZE) {
+                    const firstKey = segmentCache.keys().next().value;
+                    if (firstKey) segmentCache.delete(firstKey);
+                }
+                segmentCache.set(cacheKey, {
+                    data,
+                    timestamp: Date.now(),
+                    headers: responseHeaders
+                });
+                console.log(`[Stream] Cache STORED for ${cacheKey} (${data.length} bytes)`);
+            }
+
+            const res = h.response(data);
+            Object.entries(responseHeaders).forEach(([k, v]) => res.header(k, v));
+            return res.code(response.status);
+
+        } else {
+            // Stream Logic (No Caching)
+            console.log(`[Stream] Piping stream directly (no cache) for ${cacheKey}`);
+            const res = h.response(response.data);
+            if (response.headers['content-range']) res.header('Content-Range', response.headers['content-range']);
+            if (response.headers['content-length']) res.header('Content-Length', response.headers['content-length']);
+            if (response.headers['content-type']) res.header('Content-Type', response.headers['content-type']);
+            if (response.headers['accept-ranges']) res.header('Accept-Ranges', response.headers['accept-ranges']);
+            return res.code(response.status);
+        }
 
     } catch (error: any) {
         console.error(`[Stream] Proxy failed: ${error.message}`);

@@ -17,8 +17,6 @@ export const getMp4Ranges = async (url: string, customHeaders?: Record<string, s
             ...customHeaders
         };
 
-        console.log(`[Mp4Parser] Requesting ${url.substring(0, 50)}... with headers:`, JSON.stringify(headers));
-
         // Fetch first 64KB to find atoms
         const response = await axios.get(url, {
             headers: headers,
